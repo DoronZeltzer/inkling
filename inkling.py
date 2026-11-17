@@ -4,7 +4,7 @@
   inkling.py daemon                 watch the pen, open the canvas on a double tap
   inkling.py canvas [--screenshot FILE] [--open NAME] [FILE ...]
                                      open the canvas directly (also used by the daemon and
-                                     "Open with Inkling": .pennote notes, pictures, slides)
+                                     "Open with Inkling": .inkling notes, pictures, slides)
 
 Each save writes, into the Obsidian vault: a PNG of everything on the canvas, a markdown
 note that embeds it (with an "Edit in Inkling" link), and a hidden editable copy so the note
@@ -41,8 +41,8 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
 VAULT = Path.home() / "Obsidian" / "Main"
-NOTES_DIR = Path(os.environ.get("PEN_NOTE_DIR") or VAULT / "Pen Notes")
-PROJECT_DIR = NOTES_DIR / ".pennote"   # hidden: Obsidian ignores dot-folders
+NOTES_DIR = Path(os.environ.get("INKLING_DIR") or VAULT / "Inkling")
+PROJECT_DIR = NOTES_DIR / ".inkling"   # hidden: Obsidian ignores dot-folders
 SELF = Path(__file__).resolve()
 
 # --- double-tap tuning (my defaults, tweak here) -----------------------------
@@ -100,7 +100,7 @@ def take_screenshot():
     bus = Gio.bus_get_sync(Gio.BusType.SESSION)
     loop = GLib.MainLoop()
     sender = bus.get_unique_name()[1:].replace(".", "_")
-    token = f"pennote{os.getpid()}x{int(time.time())}"
+    token = f"inkling{os.getpid()}x{int(time.time())}"
     req = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
     result = {}
 
@@ -442,7 +442,7 @@ class PasswordNeeded(Exception):
 
 
 def config_dir():
-    return Path(os.environ.get("PEN_NOTE_CONFIG") or Path.home() / ".config" / "pen-note")
+    return Path(os.environ.get("INKLING_CONFIG") or Path.home() / ".config" / "inkling")
 
 
 def make_certificate(name, email, password, path):
@@ -497,9 +497,9 @@ def sign_pdf(src, dst, p12, password, stamp=None, reason=""):
         writer = IncrementalPdfFileWriter(f)
         style = None
         if stamp:
-            fields.append_signature_field(writer, fields.SigFieldSpec("PenNoteSignature", on_page=stamp[0], box=stamp[1]))
+            fields.append_signature_field(writer, fields.SigFieldSpec("InklingSignature", on_page=stamp[0], box=stamp[1]))
             style = TextStampStyle(stamp_text="Digitally signed by\n%(signer)s\n%(ts)s")
-        meta = signers.PdfSignatureMetadata(field_name="PenNoteSignature", reason=reason or None)
+        meta = signers.PdfSignatureMetadata(field_name="InklingSignature", reason=reason or None)
         with open(dst, "wb") as out:
             signers.PdfSigner(meta, signer=signer, stamp_style=style).sign_pdf(writer, output=out)
     cert = signer.signing_cert
@@ -556,10 +556,10 @@ def pdf_member(path):
 
 def ensure_edit_link(md, base):
     """Make sure a note carries a link that opens it, editable, in Inkling (works from Obsidian)."""
-    link = f"[Edit in Inkling](pennote://open/{quote(base, safe='')})"
+    link = f"[Edit in Inkling](inkling://open/{quote(base, safe='')})"
     text = md.read_text()
-    if "pennote://open/" in text:
-        new = re.sub(r"\[Edit in (?:Pen Note|Inkling)\]\(pennote://open/[^)]*\)", lambda _: link, text)
+    if "inkling://open/" in text:
+        new = re.sub(r"\[Edit in Inkling\]\(inkling://open/[^)]*\)", lambda _: link, text)
     else:
         new = text.rstrip("\n") + f"\n\n{link}\n"
     if new != text:
@@ -772,7 +772,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
     class Canvas(Gtk.Widget):
         """Drawing surface; renders through GTK's snapshot API (no cairo bridge needed)."""
-        __gtype_name__ = "PenNoteCanvas"
+        __gtype_name__ = "InklingCanvas"
 
         def __init__(self, app):
             super().__init__(hexpand=True, vexpand=True, focusable=True)
@@ -845,8 +845,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
     class App(Gtk.Application):
         def __init__(self):
-            suffix = ".selftest" if os.environ.get("PEN_NOTE_SELFTEST") else ""
-            super().__init__(application_id="local.pennote.canvas" + suffix,
+            suffix = ".selftest" if os.environ.get("INKLING_SELFTEST") else ""
+            super().__init__(application_id="local.inkling.canvas" + suffix,
                              flags=Gio.ApplicationFlags.HANDLES_OPEN)   # files from "Open with"
             self.win = None
             self.signing = None       # while drawing a new signature: what the surface held before
@@ -904,7 +904,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.do_activate()
             for f in files:
                 uri = f.get_uri() or ""
-                if uri.startswith("pennote:"):               # the "Edit in Inkling" link in Obsidian
+                if uri.startswith("inkling:"):               # the "Edit in Inkling" link in Obsidian
                     self.open_note(safe_name(Path(unquote(urlparse(uri).path)).name))
                 elif f.get_path():
                     self.open_path(f.get_path())
@@ -913,9 +913,9 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             ext = Path(p).suffix.lower()
             stem = Path(p).stem
             if (ext in (".png", ".md") and Path(p).resolve().parent == NOTES_DIR.resolve()
-                    and (PROJECT_DIR / f"{stem}.pennote").exists()):
+                    and (PROJECT_DIR / f"{stem}.inkling").exists()):
                 self.open_note(stem)                         # an Inkling note's own picture: edit the note
-            elif ext == ".pennote":
+            elif ext == ".inkling":
                 self.open_project_file(p)
             elif ext in SLIDE_EXTS:
                 self.add_slide_file(p)
@@ -1064,7 +1064,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             root.append(self.area)
             self.editor = Gtk.TextView(wrap_mode=Gtk.WrapMode.NONE, visible=False, left_margin=0, right_margin=0,
                                        top_margin=0, bottom_margin=0)
-            self.editor.add_css_class("pennote-editor")
+            self.editor.add_css_class("inkling-editor")
             self.editor_css = Gtk.CssProvider()
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.editor_css,
                                                       Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -1164,7 +1164,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.area.grab_focus()
             if slides:
                 self.add_slide_file(slides)
-            if os.environ.get("PEN_NOTE_SELFTEST"):
+            if os.environ.get("INKLING_SELFTEST"):
                 GLib.timeout_add(1500, lambda: __import__("selftest").run(self))
 
         def place_screenshot(self, tex):
@@ -1292,7 +1292,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             for doc in self.docs:
                 row = Gtk.Box(spacing=2)
                 if doc is self.cur:
-                    row.add_css_class("pennote-tab-active")
+                    row.add_css_class("inkling-tab-active")
                 title = self.doc_title(doc)
                 b = Gtk.Button(label=("• " if doc.dirty else "") + title, hexpand=True)
                 b.add_css_class("flat")
@@ -1377,7 +1377,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             it = e["item"]
             r, g, b = (int(c * 255) for c in it.color)
             self.editor_css.load_from_string(
-                ".pennote-editor, .pennote-editor text { background: transparent; color: rgb(%d,%d,%d); "
+                ".inkling-editor, .inkling-editor text { background: transparent; color: rgb(%d,%d,%d); "
                 "font-family: Sans; font-size: %.1fpx; padding: 0; margin: 0; }" % (r, g, b, max(it.size * self.zoom, 6.0)))
             self.area.editor_pos = (it.x * self.zoom + self.ox, it.y * self.zoom + self.oy)
             self.area.queue_allocate()
@@ -1657,7 +1657,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         # ---- slides ----------------------------------------------------------
         # ---- left panel: what to open, page tools, recent notes ------------------
         def ui_file(self):
-            if os.environ.get("PEN_NOTE_SELFTEST") and not os.environ.get("PEN_NOTE_CONFIG"):
+            if os.environ.get("INKLING_SELFTEST") and not os.environ.get("INKLING_CONFIG"):
                 return None                                 # a self-test never touches your real settings
             return config_dir() / "window.json"
 
@@ -1716,7 +1716,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             button("+ New note", self.on_new_tab, "A blank note in its own tab")
             self.tab_css = Gtk.CssProvider()
             self.tab_css.load_from_string(("@define-color accent_bg_color #7c3aed; @define-color accent_color #7c3aed; "
-                                      ".pennote-tab-active { background: alpha(#a78bfa, 0.25); border-radius: 6px; } "
+                                      ".inkling-tab-active { background: alpha(#a78bfa, 0.25); border-radius: 6px; } "
                                       "window.inkling-win { background: #27242f; }"))
             self.win.add_css_class("inkling-win")
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.tab_css,
@@ -3326,7 +3326,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     png = md.with_suffix(".png")
                     if not png.exists():
                         continue
-                    proj = PROJECT_DIR / f"{md.stem}.pennote"
+                    proj = PROJECT_DIR / f"{md.stem}.inkling"
                     notes.append((md.stem, png.stat().st_mtime, proj.exists()))
             return sorted(notes, key=lambda n: n[1], reverse=True)
 
@@ -3345,12 +3345,12 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     text = f"{base}\n{when}" + ("" if editable else "  ·  image only")
                     row.set_child(Gtk.Label(label=text, xalign=0, margin_top=6, margin_bottom=6,
                                             margin_start=10, margin_end=10))
-                    row.pennote_base = base
+                    row.inkling_base = base
                     lb.append(row)
 
                 def chosen(_lb, row):
                     dlg.close()
-                    self.open_note(row.pennote_base)
+                    self.open_note(row.inkling_base)
                 lb.connect("row-activated", chosen)
                 sc = Gtk.ScrolledWindow()
                 sc.set_child(lb)
@@ -3367,7 +3367,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.tab_for_new(None)                       # the empty tab you are on, or a new one
             if self.dirty and (self.has_content() or self.saved_base):
                 self.save()                                  # reopening this very note: keep what is on screen
-            proj = PROJECT_DIR / f"{base}.pennote"
+            proj = PROJECT_DIR / f"{base}.inkling"
             png = NOTES_DIR / f"{base}.png"
             try:
                 if proj.exists():
@@ -3403,7 +3403,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.refresh_tabs()
 
         def open_project_file(self, p):
-            """Open a .pennote file. One from the vault continues that note; any other is a copy
+            """Open a .inkling file. One from the vault continues that note; any other is a copy
             that Save puts into the vault as a new note."""
             p = Path(p).resolve()
             if p.parent == PROJECT_DIR.resolve() and (NOTES_DIR / f"{p.stem}.png").exists():
@@ -3450,7 +3450,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 old = self.saved_base
 
                 self.render_png(NOTES_DIR / f"{base}.png")
-                self.write_project(PROJECT_DIR / f"{base}.pennote")
+                self.write_project(PROJECT_DIR / f"{base}.inkling")
 
                 md = NOTES_DIR / f"{base}.md"
                 if old and old != base and (NOTES_DIR / f"{old}.md").exists():
@@ -3461,19 +3461,19 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     md.write_text(
                         "---\n"
                         f"created: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-                        "tags: [pen-note]\n"
+                        "tags: [inkling]\n"
                         "---\n\n"
                         f"![[{base}.png]]\n")
 
                 ensure_edit_link(md, base)
                 if old and old != base:                      # drop the old name's files
                     for f in (NOTES_DIR / f"{old}.md", NOTES_DIR / f"{old}.png",
-                              PROJECT_DIR / f"{old}.pennote"):
+                              PROJECT_DIR / f"{old}.inkling"):
                         f.unlink(missing_ok=True)
                 self.saved_base = base
                 self.dirty = False
                 self.update_title()
-                self.status.set_text(f"Saved: Pen Notes/{base}")
+                self.status.set_text(f"Saved: Inkling/{base}")
                 self.refresh_recent()
                 self.refresh_tabs()
                 return True
@@ -3517,7 +3517,7 @@ def main():
     c.add_argument("--screenshot")
     c.add_argument("--open", dest="open_name")
     c.add_argument("--slides", help="a PowerPoint/OpenDocument/PDF file to lay out on the canvas")
-    c.add_argument("files", nargs="*", help="notes (.pennote), pictures or slides to open")
+    c.add_argument("files", nargs="*", help="notes (.inkling), pictures or slides to open")
     args = ap.parse_args()
     if args.mode == "daemon":
         run_daemon()

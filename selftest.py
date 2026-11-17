@@ -1,6 +1,6 @@
-"""Inkling's self-test: run with PEN_NOTE_SELFTEST=<mode> PEN_NOTE_DIR=<scratch folder> inkling.py canvas.
+"""Inkling's self-test: run with INKLING_SELFTEST=<mode> INKLING_DIR=<scratch folder> inkling.py canvas.
 
-Needs a display. PEN_NOTE_DIR is required: the test saves, renames and deletes notes there."""
+Needs a display. INKLING_DIR is required: the test saves, renames and deletes notes there."""
 import json
 import os
 import re
@@ -21,7 +21,7 @@ from inkling import (EXPORT_MAX_PIXELS, PAGE_TEXTURES, PDF_STORE, Item, migrate_
 
 def strip_link(text):
     """The note without the 'Edit in Inkling' line that every save adds."""
-    return re.sub(r"\n\n\[Edit in (?:Pen Note|Inkling)\]\([^)]*\)\n$", "\n", text)
+    return re.sub(r"\n\n\[Edit in Inkling\]\([^)]*\)\n$", "\n", text)
 
 
 def pixels(pdf, page, dpi=40):
@@ -40,11 +40,11 @@ def count_px(data, test):
 def run(self):
     import tempfile
     import cairo
-    if not os.environ.get("PEN_NOTE_DIR"):   # the test deletes notes: never let it near the real vault
-        log("selftest refused: set PEN_NOTE_DIR to a scratch folder first")
+    if not os.environ.get("INKLING_DIR"):   # the test deletes notes: never let it near the real vault
+        log("selftest refused: set INKLING_DIR to a scratch folder first")
         self.win.close()
         return False
-    mode = os.environ["PEN_NOTE_SELFTEST"]
+    mode = os.environ["INKLING_SELFTEST"]
     w, h = self.canvas_size()
 
     def line(x0, y0, x1, y1):
@@ -54,8 +54,8 @@ def run(self):
         self.finish()
 
     if mode == "slides":
-        deck, pdf = os.environ["PEN_NOTE_TEST_DECK"], os.environ["PEN_NOTE_TEST_PDF"]
-        bad = os.environ["PEN_NOTE_TEST_BAD"]
+        deck, pdf = os.environ["INKLING_TEST_DECK"], os.environ["INKLING_TEST_PDF"]
+        bad = os.environ["INKLING_TEST_BAD"]
         st = {}
 
         def pics():
@@ -102,7 +102,7 @@ def run(self):
             dims = struct.unpack(">II", (NOTES_DIR / f"{base}.png").read_bytes()[16:24])
             log("selftest slides save ok:", ok, "| png", dims,
                 "| within limits:", max(dims) <= EXPORT_MAX_SIDE and dims[0] * dims[1] <= EXPORT_MAX_PIXELS * 1.01,
-                "| editable copy kb:", (PROJECT_DIR / f"{base}.pennote").stat().st_size // 1024)
+                "| editable copy kb:", (PROJECT_DIR / f"{base}.inkling").stat().st_size // 1024)
             n_items, n_strokes = len(self.items), len(self.strokes)
             self.strokes, self.items = [], []
             self.open_note(base)
@@ -184,7 +184,7 @@ def run(self):
         return False
     if mode == "slides2":
         # two decks started at once plus a duplicate: no collision, no silence
-        deck, deck2 = os.environ["PEN_NOTE_TEST_DECK"], os.environ["PEN_NOTE_TEST_DECK2"]
+        deck, deck2 = os.environ["INKLING_TEST_DECK"], os.environ["INKLING_TEST_DECK2"]
         st = {"left": 2}
 
         def finished():
@@ -344,7 +344,7 @@ def run(self):
         self.win.close()
         return False
     if mode == "look":
-        # not a check: saves pictures of the window ($PEN_NOTE_LOOK-select.png and -edit.png) so the screen can be looked at
+        # not a check: saves pictures of the window ($INKLING_LOOK-select.png and -edit.png) so the screen can be looked at
         line(100, 120, 380, 150)
         line(100, 200, 380, 215)
         line(100, 280, 380, 300)
@@ -360,7 +360,7 @@ def run(self):
             s = Gtk.Snapshot()
             paint.snapshot(s, w, h)
             tex = self.get_renderer().render_texture(s.to_node(), Graphene.Rect().init(0, 0, w, h))
-            tex.save_to_png(os.environ["PEN_NOTE_LOOK"] + name)
+            tex.save_to_png(os.environ["INKLING_LOOK"] + name)
 
         def second():
             shot("-edit.png")
@@ -435,7 +435,7 @@ def run(self):
         # not a check: pictures of the window with several tabs, the panel open and then collapsed
         import cairo
         d = tempfile.mkdtemp()
-        os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"
+        os.environ["INKLING_CONFIG"] = f"{d}/cfg"
         paths = []
         for name in ("Contract", "Lecture 3 slides with a very long name", "Budget"):
             p = f"{d}/{name}.pdf"
@@ -454,7 +454,7 @@ def run(self):
             s = Gtk.Snapshot()
             paint.snapshot(s, w, h)
             tex = self.get_renderer().render_texture(s.to_node(), Graphene.Rect().init(0, 0, w, h))
-            tex.save_to_png(os.environ["PEN_NOTE_LOOK"] + name)
+            tex.save_to_png(os.environ["INKLING_LOOK"] + name)
 
         def step3():
             line(150, 300, 400, 340)
@@ -470,7 +470,7 @@ def run(self):
     if mode == "tabs":
         import cairo
         d = tempfile.mkdtemp()
-        os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"
+        os.environ["INKLING_CONFIG"] = f"{d}/cfg"
         files = {}
         for name, pages in (("a", 2), ("b", 3), ("c", 1)):
             files[name] = f"{d}/{name}.pdf"
@@ -537,7 +537,7 @@ def run(self):
         self.add_slide_file(files["a"], done=after_a)
         return False
     if mode == "dialogs":
-        os.environ["PEN_NOTE_CONFIG"] = tempfile.mkdtemp()
+        os.environ["INKLING_CONFIG"] = tempfile.mkdtemp()
         self.commit_text(None, (50, 50), "something to sign")
         before = len(Gtk.Window.list_toplevels())
         self.ask_password(self.cur, "/tmp/x.pdf", "x.pdf", None, True)
@@ -555,7 +555,7 @@ def run(self):
         from pypdf import PdfReader, PdfWriter
         from inkling import PasswordNeeded, check_signature, convert_slides, make_certificate, sign_pdf
         d = tempfile.mkdtemp()
-        os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"               # never touch the real saved signature or certificate
+        os.environ["INKLING_CONFIG"] = f"{d}/cfg"               # never touch the real saved signature or certificate
         raw, locked = f"{d}/raw.pdf", f"{d}/locked.pdf"
         surf = cairo.PDFSurface(raw, 595, 842)
         c = cairo.Context(surf)
@@ -741,7 +741,7 @@ def run(self):
         import zipfile as _zip
         png = _io.BytesIO()
         cairo.ImageSurface(cairo.FORMAT_ARGB32, 595, 842).write_to_png(png)
-        v1 = f"{d}/old.pennote"
+        v1 = f"{d}/old.inkling"
         with _zip.ZipFile(v1, "w") as zf:
             zf.writestr("state.json", _json.dumps({"version": 1, "view": {"zoom": 1, "ox": 0, "oy": 0}, "strokes": [], "items": [
                 {"kind": "image", "x": 100.0, "y": 50.0, "width": 595.0, "text": "", "size": 24.0, "color": [0.08, 0.08, 0.08],
@@ -938,7 +938,7 @@ def run(self):
                 "| it is page 2:", "Page 2" in (PdfReader(part).pages[0].extract_text() or ""))
 
             # signing: draw once (saved), place it on page 2, it shows up in the PDF
-            os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"               # never touch the real saved signature
+            os.environ["INKLING_CONFIG"] = f"{d}/cfg"               # never touch the real saved signature
             self.color = (0.08, 0.08, 0.08)
             n_strokes, n_undo = len(self.strokes), len(self.undo_stack)
             self.start_signature()
@@ -977,7 +977,7 @@ def run(self):
             self.name_entry.set_text("pdf note")
             ok = self.save()
             md = (NOTES_DIR / "pdf note.md").read_text()
-            log("selftest pdf save: ok:", ok, "| note has the Edit link:", "pennote://open/pdf%20note" in md)
+            log("selftest pdf save: ok:", ok, "| note has the Edit link:", "inkling://open/pdf%20note" in md)
             self.strokes, self.items = [], []
             self.open_note("pdf note")
             again = f"{d}/again.pdf"
@@ -1083,7 +1083,7 @@ def run(self):
     dims = struct.unpack(">II", png.read_bytes()[16:24])
     log("selftest save ok:", ok, "| base:", base, "| png", dims,
         "| md:", (NOTES_DIR / f"{base}.md").exists(),
-        "| editable copy:", (PROJECT_DIR / f"{base}.pennote").exists())
+        "| editable copy:", (PROJECT_DIR / f"{base}.inkling").exists())
     log("selftest png cropped and bounded:", max(dims) <= EXPORT_MAX_SIDE
         and dims[0] * dims[1] <= EXPORT_MAX_PIXELS * 1.01 and max(dims) > 1000)
 
@@ -1108,7 +1108,7 @@ def run(self):
     legacy = NOTES_DIR / "legacy note"
     png.replace(NOTES_DIR / "legacy note.png")
     legacy.with_suffix(".md").write_text("My own text\n![[legacy note.png]]\n")
-    for f in PROJECT_DIR.glob("*.pennote"):
+    for f in PROJECT_DIR.glob("*.inkling"):
         f.unlink()
     self.strokes, self.items = [], []
     self.saved_base = None
@@ -1120,7 +1120,7 @@ def run(self):
     md_text = strip_link(legacy.with_suffix(".md").read_text())
     log("selftest legacy open: ok:", ok_legacy, "| save keeps my markdown untouched:",
         md_text == "My own text\n![[legacy note.png]]\n",
-        "| now editable:", (PROJECT_DIR / "legacy note.pennote").exists())
+        "| now editable:", (PROJECT_DIR / "legacy note.inkling").exists())
 
     # rename keeps what was added to the note in Obsidian and fixes the embed
     legacy.with_suffix(".md").write_text("My own text\n![[legacy note.png]]\n")
@@ -1131,6 +1131,6 @@ def run(self):
     log("selftest rename: ok:", ren == "My own text\n![[renamed note.png]]\n",
         "| old files removed:", not (NOTES_DIR / "legacy note.md").exists()
         and not (NOTES_DIR / "legacy note.png").exists()
-        and not (PROJECT_DIR / "legacy note.pennote").exists())
+        and not (PROJECT_DIR / "legacy note.inkling").exists())
     self.win.close()
     return False
