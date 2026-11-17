@@ -431,6 +431,42 @@ def run(self):
             next_one()
         self.add_slide_file(src, done=opened)
         return False
+    if mode == "look2":
+        # not a check: pictures of the window with several tabs, the panel open and then collapsed
+        import cairo
+        d = tempfile.mkdtemp()
+        os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"
+        paths = []
+        for name in ("Contract", "Lecture 3 slides with a very long name", "Budget"):
+            p = f"{d}/{name}.pdf"
+            surf = cairo.PDFSurface(p, 595, 842)
+            c = cairo.Context(surf)
+            c.set_font_size(40)
+            c.move_to(80, 200)
+            c.show_text(name[:12])
+            surf.show_page()
+            surf.finish()
+            paths.append(p)
+
+        def shot(name):
+            w, h = self.win.get_width(), self.win.get_height()
+            paint = Gtk.WidgetPaintable.new(self.win)
+            s = Gtk.Snapshot()
+            paint.snapshot(s, w, h)
+            tex = self.get_renderer().render_texture(s.to_node(), Graphene.Rect().init(0, 0, w, h))
+            tex.save_to_png(os.environ["PEN_NOTE_LOOK"] + name)
+
+        def step3():
+            line(150, 300, 400, 340)
+            self.switch_to(self.docs[1])
+            self.nav_btn.set_active(True)
+            GLib.timeout_add(500, lambda: (shot("-tabs.png"), self.nav_btn.set_active(False),
+                                           GLib.timeout_add(1500, lambda: (self.area.queue_draw(), GLib.timeout_add(500, lambda: (shot("-collapsed.png"), self.win.close(), False)[2]), False)[2]), False)[3])
+
+        def after_a():
+            self.add_slide_file(paths[1], done=lambda: self.add_slide_file(paths[2], done=step3))
+        self.add_slide_file(paths[0], done=after_a)
+        return False
     if mode == "tabs":
         import cairo
         d = tempfile.mkdtemp()
@@ -473,11 +509,12 @@ def run(self):
             log("selftest tabs: opening an open file jumps to its tab:", len(self.docs) == 2 and self.cur.source == files["a"])
             self.on_new_tab()
             log("selftest tabs: a new note is a blank tab:", len(self.docs) == 3 and self.is_blank(self.cur))
+            known = set(NOTES_DIR.glob("*.md"))
             self.close_tab(self.docs[1])                                    # saved as a note, tab gone
-            kept = list(NOTES_DIR.glob("*.md"))
+            kept = [m for m in NOTES_DIR.glob("*.md") if m not in known]
             log("selftest tabs: closing a tab keeps what was in it as a note and removes the tab:",
-                len(self.docs) == 2 and len(kept) >= 1)
-            base = sorted(m.stem for m in kept)[0]
+                len(self.docs) == 2 and len(kept) == 1)
+            base = kept[0].stem
             self.open_note(base)
             log("selftest tabs: a saved note opens in the empty tab (no extra tab):", len(self.docs) == 2
                 and self.saved_base == base and pages() == 4)
