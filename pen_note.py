@@ -1187,7 +1187,14 @@ def run_canvas(screenshot, open_name=None, slides=None):
                     pb.move_to(pts[i][0], pts[i][1])
                     j = i
                     while j < len(pts) - 1 and round((pts[j][2] + pts[j + 1][2]) / 2 * 6) == bucket:
-                        pb.line_to(pts[j + 1][0], pts[j + 1][1])
+                        # Catmull-Rom spline through the real points, drawn as a cubic
+                        # bezier per segment: smooth curves instead of a jagged polyline
+                        p0 = pts[max(j - 1, 0)]
+                        p1, p2 = pts[j], pts[j + 1]
+                        p3 = pts[min(j + 2, len(pts) - 1)]
+                        pb.cubic_to(p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6,
+                                    p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6,
+                                    p2[0], p2[1])
                         j += 1
                     stroke = Gsk.Stroke.new(s.width * (0.4 + bucket / 6))
                     stroke.set_line_cap(Gsk.LineCap.ROUND)
