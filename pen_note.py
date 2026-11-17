@@ -929,7 +929,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             if self.win is not None:                 # already open: just bring it forward
                 self.win.present()
                 return
-            win = Gtk.ApplicationWindow(application=self, title="Pen Note")
+            win = Gtk.ApplicationWindow(application=self, title="Inkling")
             self.win = win
             win.set_default_size(1440, 800)
 
@@ -1214,7 +1214,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         def update_title(self):
             title = self.doc_title(self.cur)
-            self.win.set_title("Pen Note" if title == "Untitled" else f"Pen Note: {title}")
+            self.win.set_title("Inkling" if title == "Untitled" else f"Inkling: {title}")
 
         def is_blank(self, doc):
             return (not doc.source and not self.peek(doc, "saved_base") and not self.peek(doc, "strokes")
