@@ -594,6 +594,13 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
     gi.require_version("Graphene", "1.0")
     gi.require_version("Pango", "1.0")
     from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango
+    try:                       # needs python3-gi-cairo: typed text then goes into PDFs as real text
+        gi.require_version("PangoCairo", "1.0")
+        import cairo
+        from gi.repository import PangoCairo
+        PangoCairo.create_layout(cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)))
+    except Exception:  # noqa: BLE001
+        PangoCairo = None
 
     class Canvas(Gtk.Widget):
         """Drawing surface; renders through GTK's snapshot API (no cairo bridge needed)."""
@@ -1461,7 +1468,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 if text != cover["text"]:                    # unchanged: leave the page alone
                     x, y, w, h = cover["rect"]
                     self.push_undo()
-                    self.items.append(Item("cover", x - 1, y - 1, width=w + 2, size=h + 2, color=cover["bg"]))
+                    self.items.append(Item("cover", x - 1, y - 1, width=w + 2, size=h + 2, color=cover["bg"],
+                                           text=cover["text"]))        # the words it replaced
                     if text:
                         t = Item("text", x, y, text=text, size=cover["font"], color=cover["fg"])
                         self.items.append(t)
@@ -2127,28 +2135,34 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     for _, c1, c2, p2 in segs:
                         ctx.curve_to(*c1, *c2, *p2)
                     ctx.stroke()
-            for it in self.items:                                  # typed text: the shaped glyph outlines, filled
+            for it in self.items:                                  # typed text
                 if it.kind != "text":
                     continue
-                pb = Gsk.PathBuilder.new()
-                pb.add_layout(self.make_layout(it))
                 ctx.save()
                 ctx.translate(it.x, it.y)
                 ctx.set_source_rgb(*it.color)
+                if PangoCairo is not None:                         # real text: selectable and searchable
+                    layout = PangoCairo.create_layout(ctx)
+                    layout.set_text(it.text, -1)
+                    layout.set_font_description(self.make_layout(it).get_font_description())
+                    PangoCairo.show_layout(ctx, layout)
+                else:                                              # no python3-gi-cairo: sharp outlines instead
+                    pb = Gsk.PathBuilder.new()
+                    pb.add_layout(self.make_layout(it))
 
-                def seg(op, pts, n, weight, _data=None):
-                    kind = op.value_nick
-                    if kind == "move":
-                        ctx.move_to(pts[0].x, pts[0].y)
-                    elif kind == "line":
-                        ctx.line_to(pts[1].x, pts[1].y)
-                    elif kind == "cubic":
-                        ctx.curve_to(pts[1].x, pts[1].y, pts[2].x, pts[2].y, pts[3].x, pts[3].y)
-                    elif kind == "close":
-                        ctx.close_path()
-                    return True
-                pb.to_path().foreach(Gsk.PathForeachFlags.CUBIC, seg)
-                ctx.fill()
+                    def seg(op, pts, n, weight, _data=None):
+                        kind = op.value_nick
+                        if kind == "move":
+                            ctx.move_to(pts[0].x, pts[0].y)
+                        elif kind == "line":
+                            ctx.line_to(pts[1].x, pts[1].y)
+                        elif kind == "cubic":
+                            ctx.curve_to(pts[1].x, pts[1].y, pts[2].x, pts[2].y, pts[3].x, pts[3].y)
+                        elif kind == "close":
+                            ctx.close_path()
+                        return True
+                    pb.to_path().foreach(Gsk.PathForeachFlags.CUBIC, seg)
+                    ctx.fill()
                 ctx.restore()
             ctx.restore()
 
@@ -2162,7 +2176,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return self.export_canvas_pdf(path)
             if only:
                 pages = [pages[n - 1] for n in only]
-            readers, writer, checks = {}, PdfWriter(), []
+            readers, writer, probe, checks = {}, PdfWriter(), PdfWriter(), []
             for it in pages:
                 src, idx = it.pdf
                 if src not in readers:
@@ -2182,7 +2196,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         (float(crop.left) + (c.x - box[0]) * k, float(crop.top) - (c.y + c.size - box[1]) * k,
                          float(crop.left) + (c.x + c.width - box[0]) * k, float(crop.top) - (c.y - box[1]) * k)
                         for c in covers])
-                    checks.append((len(writer.pages),
+                    probe.add_page(page)                           # a copy as it is now: old text out, nothing on top yet
+                    checks.append((len(probe.pages),
                                    [((c.x - box[0]) * k, (c.y - box[1]) * k, c.width * k, c.size * k) for c in covers]))
                 if self.marks_in(box):
                     buf = io.BytesIO()
@@ -2199,12 +2214,19 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 writer.write(f)
             os.replace(tmp, path)
             result = {"covers": sum(len(r) for _, r in checks), "left": 0}
-            for pageno, rects in checks:                           # is any of the old text still in the file?
-                lines = pdf_text_lines(path, pageno)[2]
-                for rx, ry, rw, rh in rects:
-                    if any(max(0.0, min(x1, rx + rw) - max(x0, rx)) * max(0.0, min(y1, ry + rh) - max(y0, ry))
-                           > 0.25 * rw * rh for _t, x0, y0, x1, y1 in lines):
-                        result["left"] += 1
+            if checks:                                             # is any of the old text still in those pages?
+                tmp_probe = f"{path}.probe"
+                with open(tmp_probe, "wb") as f:
+                    probe.write(f)
+                try:
+                    for pageno, rects in checks:
+                        lines = pdf_text_lines(tmp_probe, pageno)[2]
+                        for rx, ry, rw, rh in rects:
+                            if any(max(0.0, min(x1, rx + rw) - max(x0, rx)) * max(0.0, min(y1, ry + rh) - max(y0, ry))
+                                   > 0.25 * rw * rh for _t, x0, y0, x1, y1 in lines):
+                                result["left"] += 1
+                finally:
+                    os.unlink(tmp_probe)
             return result
 
         def export_canvas_pdf(self, path):

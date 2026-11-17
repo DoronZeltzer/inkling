@@ -305,8 +305,8 @@ def run(self):
             out = f"{d}/out.pdf"
             res = self.export_pdf(out)
             plain = subprocess.run(["pdftotext", out, "-"], capture_output=True, text=True).stdout
-            log("selftest hebrew: old Hebrew removed from the file, other line kept:",
-                "משפט" not in plain and "Plain line" in plain, "| report:", res)
+            log("selftest hebrew: old Hebrew removed, the retyped Hebrew is real text, other line kept:",
+                "משפט" not in plain and "Plain line" in plain and "חדש" in plain, "| report:", res)
             shutil.rmtree(d, ignore_errors=True)
             self.win.close()
 
@@ -399,8 +399,8 @@ def run(self):
                 "| new text is drawn there:", 0 < band(new, 0.12, 0.26) < before_1 * 3,
                 "| next line untouched:", band(new, 0.28, 0.42) == before_2)
             text_after = PdfReader(new).pages[0].extract_text() or ""
-            log("selftest pdftext privacy: old words are gone from the file, other line kept:",
-                "Original" not in text_after and "Second line" in text_after,
+            log("selftest pdftext privacy: old words are gone, the retyped line is real text, other line kept:",
+                "Original" not in text_after and "Second line" in text_after and "Changed it" in text_after,
                 "| report:", result)
 
             self.name_entry.set_text("text edit note")
@@ -533,9 +533,9 @@ def run(self):
             _, _, turned = pixels(out, 1)
             _, _, plain = pixels(src, 3)
             ink = lambda data: count_px(data, lambda r_, g, b: min(r_, g, b) < 150)      # the typed text is blue
-            log("selftest pdf export: typed text (Hebrew too) is in page 1 as outlines, not a picture:",
-                len(imgs) <= 2 and ink(turned) > ink(plain) * 1.2, "| images:", len(imgs) - 2,
-                "| ink turned/plain:", ink(turned), ink(plain))
+            log("selftest pdf export: typed text is real, selectable text on page 1 (not a picture):",
+                len(imgs) <= 2 and ink(turned) > ink(plain) * 1.2 and "Hello" in text1 and "Page 3" in text1,
+                "| images:", len(imgs) - 2)
 
             part = f"{d}/part.pdf"
             self.export_pdf(part, [2])
