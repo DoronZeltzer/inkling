@@ -2,7 +2,9 @@
 
 Needs a display. PEN_NOTE_DIR is required: the test saves, renames and deletes notes there."""
 import os
+import re
 import shutil
+import subprocess
 import struct
 import time
 
@@ -12,6 +14,24 @@ from gi.repository import Gdk, GLib  # noqa: E402
 
 from pen_note import (CACHE_DIR, EXPORT_MAX_PIXELS, EXPORT_MAX_SIDE, NOTES_DIR, PROJECT_DIR,  # noqa: E402
                       SLIDE_GAP_RATIO, WORK_DIR, log)
+
+def strip_link(text):
+    """The note without the 'Edit in Pen Note' line that every save adds."""
+    return re.sub(r"\n\n\[Edit in Pen Note\]\([^)]*\)\n$", "\n", text)
+
+
+def pixels(pdf, page, dpi=40):
+    """RGB pixels of one page of a PDF: (width, height, bytes)."""
+    out = subprocess.run(["pdftoppm", "-r", str(dpi), "-f", str(page), "-l", str(page), "-singlefile", str(pdf)],
+                         capture_output=True, check=True).stdout
+    head = out.split(b"\n", 3)
+    w, h = map(int, head[1].split())
+    return w, h, head[3]
+
+
+def count_px(data, test):
+    return sum(1 for i in range(0, len(data) - 2, 3) if test(data[i], data[i + 1], data[i + 2]))
+
 
 def run(self):
     import tempfile
@@ -196,6 +216,132 @@ def run(self):
             "| saved_base:", self.saved_base)
         return False
 
+    if mode == "pdf":
+        import cairo
+        from pypdf import PdfReader
+        d = tempfile.mkdtemp()
+        src = f"{d}/three.pdf"
+        surf = cairo.PDFSurface(src, 595, 842)
+        c = cairo.Context(surf)
+        for n in (1, 2, 3):
+            c.set_source_rgb(1, 1, 1)
+            c.paint()
+            c.set_source_rgb(0, 0, 0)
+            c.set_font_size(60)
+            c.move_to(80, 200)
+            c.show_text(f"Page {n}")
+            surf.show_page()
+        surf.finish()
+
+        def after():
+            pages = self.pdf_pages()
+            log("selftest pdf: opened 3 pages with their PDF behind them:",
+                len(pages) == 3 and all(p.pdf for p in pages))
+            p0, p1, p2 = pages
+
+            def screen(it, fx, fy):
+                bx, by, bw, bh = self.item_box(it)
+                return (bx + bw * fx) * self.zoom + self.ox, (by + bh * fy) * self.zoom + self.oy
+
+            self.color = (0.10, 0.30, 0.85)                       # blue pen on page 2
+            (ax, ay), (bx_, by_) = screen(p1, 0.2, 0.5), screen(p1, 0.8, 0.6)
+            self.begin(ax, ay, 0.5, False)
+            self.extend((ax + bx_) / 2, (ay + by_) / 2 - 20, 0.5)
+            self.extend(bx_, by_, 0.5)
+            self.finish()
+            self.set_mode("highlight")                            # yellow highlight on page 2
+            (ax, ay), (bx_, by_) = screen(p1, 0.1, 0.25), screen(p1, 0.7, 0.25)
+            self.begin(ax, ay, 0.5, False)
+            self.extend(bx_, by_, 0.5)
+            self.finish()
+            self.set_mode("pen")
+            self.commit_text(None, self.to_world(*screen(p2, 0.2, 0.4)), "Hello שלום")   # text on page 3
+            self.set_mode("pen")
+
+            w0, h0 = self.item_box(p2)[2:]                         # rotate page 3
+            self.selected = p2
+            tx, ty = self.items[-1].x, self.items[-1].y
+            self.rotate_page()
+            w1, h1 = self.item_box(p2)[2:]
+            log("selftest pdf rotate: page turned sideways:", abs(w1 - h0) < 1 and abs(h1 - w0) < 1,
+                "| its text moved with it:", (self.items[-1].x, self.items[-1].y) != (tx, ty))
+
+            self.selected = p2                                     # move page 3 up one place
+            self.move_page(-1)
+            order = self.pdf_pages()
+            log("selftest pdf move: order is now page 1, 3, 2:", order == [p0, p2, p1],
+                "| no overlap:", all(self.item_box(order[k])[1] + self.item_box(order[k])[3] <= order[k + 1].y
+                                       for k in range(2)))
+            self.on_undo()                                        # undo hands back copies: compare by page number
+            log("selftest pdf move undo: back to 1, 2, 3:", [p.pdf[1] for p in self.pdf_pages()] == [0, 1, 2])
+            self.on_redo()
+            p0 = self.pdf_pages()[0]
+
+            y_first = p0.y                                         # delete page 1: the others move up
+            self.selected = p0
+            self.delete_page()
+            rest = self.pdf_pages()
+            log("selftest pdf delete: 2 pages left, page 1 gone:", [p.pdf[1] for p in rest] == [2, 1],
+                "| first remaining page took its place:", abs(rest[0].y - y_first) < 1e-6)
+
+            out = f"{d}/out.pdf"
+            self.export_pdf(out)
+            r = PdfReader(out)
+            first = r.pages[0]
+            text1 = first.extract_text() or ""
+            text2 = r.pages[1].extract_text() or ""
+            log("selftest pdf export: pages:", len(r.pages), "| original text still real text:",
+                "Page 3" in text1 and "Page 2" in text2,
+                "| rotated page is landscape:", float(first.mediabox.width) > float(first.mediabox.height))
+            w, h, data = pixels(out, 2)
+            blue = count_px(data, lambda r_, g, b: b > 180 and r_ < 90)
+            yellow = count_px(data, lambda r_, g, b: r_ > 220 and g > 190 and b < 170)
+            log("selftest pdf export: blue pen on page 2:", blue > 5, "| yellow highlight on page 2:", yellow > 20)
+
+            def centre(test):                                      # where on the page (0..1) the colour sits
+                xs, ys = [], []
+                for i in range(0, len(data) - 2, 3):
+                    if test(data[i], data[i + 1], data[i + 2]):
+                        xs.append((i // 3) % w / w)
+                        ys.append((i // 3) // w / h)
+                return sum(xs) / len(xs), sum(ys) / len(ys)
+            bcx, bcy = centre(lambda r_, g, b: b > 180 and r_ < 90)      # drawn from (0.2, 0.5) to (0.8, 0.6)
+            ycx, ycy = centre(lambda r_, g, b: r_ > 220 and g > 190 and b < 170)   # (0.1, 0.25) to (0.7, 0.25)
+            log("selftest pdf export: marks land where they were drawn: pen", (round(bcx, 2), round(bcy, 2)),
+                "highlight", (round(ycx, 2), round(ycy, 2)), "->",
+                abs(bcx - 0.5) < 0.08 and abs(bcy - 0.55) < 0.08 and abs(ycx - 0.4) < 0.08 and abs(ycy - 0.25) < 0.05)
+            imgs = subprocess.run(["pdfimages", "-list", out], capture_output=True, text=True).stdout.strip().splitlines()
+            log("selftest pdf export: typed text placed as a picture on page 1:", len(imgs) >= 3)
+
+            part = f"{d}/part.pdf"
+            self.export_pdf(part, [2])
+            log("selftest pdf split: one page:", len(PdfReader(part).pages) == 1,
+                "| it is page 2:", "Page 2" in (PdfReader(part).pages[0].extract_text() or ""))
+
+            # the note keeps its PDF: save, forget everything, reopen, export again
+            self.name_entry.set_text("pdf note")
+            ok = self.save()
+            md = (NOTES_DIR / "pdf note.md").read_text()
+            log("selftest pdf save: ok:", ok, "| note has the Edit link:", "pennote://open/pdf%20note" in md)
+            self.strokes, self.items = [], []
+            self.open_note("pdf note")
+            again = f"{d}/again.pdf"
+            self.export_pdf(again)
+            log("selftest pdf reopen: still 2 pages and exports:", len(self.pdf_pages()) == 2
+                and len(PdfReader(again).pages) == 2)
+
+            # no PDF at all: the whole surface becomes one page
+            self.strokes, self.items = [], []
+            line(100, 100, 400, 220)
+            flat = f"{d}/flat.pdf"
+            self.export_pdf(flat)
+            log("selftest pdf freehand: one page:", len(PdfReader(flat).pages) == 1)
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+
+        self.add_slide_file(src, done=after)
+        return False
+
     # --- full test ---
     line(100, 100, 400, 220)                                  # a stroke near the origin
     self.set_view(1.0, -6000, -4500)                          # pan far away: no limits
@@ -315,7 +461,7 @@ def run(self):
                  and not self.strokes)
     line(100, 100, 200, 160)
     self.save()
-    md_text = legacy.with_suffix(".md").read_text()
+    md_text = strip_link(legacy.with_suffix(".md").read_text())
     log("selftest legacy open: ok:", ok_legacy, "| save keeps my markdown untouched:",
         md_text == "My own text\n![[legacy note.png]]\n",
         "| now editable:", (PROJECT_DIR / "legacy note.pennote").exists())
@@ -325,7 +471,7 @@ def run(self):
     self.name_entry.set_text("renamed note")
     line(100, 200, 200, 260)
     self.save()
-    ren = (NOTES_DIR / "renamed note.md").read_text()
+    ren = strip_link((NOTES_DIR / "renamed note.md").read_text())
     log("selftest rename: ok:", ren == "My own text\n![[renamed note.png]]\n",
         "| old files removed:", not (NOTES_DIR / "legacy note.md").exists()
         and not (NOTES_DIR / "legacy note.png").exists()

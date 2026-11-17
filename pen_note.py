@@ -7,11 +7,15 @@
                                      "Open with Pen Note": .pennote notes, pictures, slides)
 
 Each save writes, into the Obsidian vault: a PNG of everything on the canvas, a markdown
-note that embeds it, and a hidden editable copy so the note can be opened and continued.
+note that embeds it (with an "Edit in Pen Note" link), and a hidden editable copy so the note
+can be opened and continued. "Save PDF" keeps opened PDF pages sharp and puts your marks on top.
+
+Needs: python3-gi with GTK4, poppler-utils (pdftoppm, pdfinfo), python3-pypdf, python3-cairo.
 """
 import argparse
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -28,7 +32,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 VAULT = Path.home() / "Obsidian" / "Main"
 NOTES_DIR = Path(os.environ.get("PEN_NOTE_DIR") or VAULT / "Pen Notes")
@@ -214,6 +218,7 @@ def run_daemon():
 # =============================================================================
 # Canvas: GTK4 window with a boundless drawing surface
 # =============================================================================
+HIGHLIGHT = (1.0, 0.88, 0.1)
 COLORS = [("Black", (0.08, 0.08, 0.08)), ("Blue", (0.10, 0.30, 0.85)),
           ("Red", (0.85, 0.15, 0.15)), ("Green", (0.10, 0.60, 0.25))]
 MIN_ZOOM, MAX_ZOOM = 0.02, 8.0
@@ -234,6 +239,9 @@ WORK_DIR = SELF.parent / "work"
 # Converted decks are kept here, so adding the same file again is instant.
 CACHE_DIR = Path(os.environ.get("PEN_NOTE_CACHE") or WORK_DIR / "cache")
 CACHE_LIMIT = 500 * 1024 * 1024    # bytes
+# The PDF behind every page picture (a converted deck, an opened PDF, a rotated copy). Kept apart
+# from the cache so pruning can never remove a file an open note still needs.
+PDF_STORE = WORK_DIR / "pdf-src"
 
 
 def seg_dist(px, py, ax, ay, bx, by):
@@ -242,6 +250,95 @@ def seg_dist(px, py, ax, ay, bx, by):
     length2 = dx * dx + dy * dy
     t = 0.0 if length2 == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
     return math.hypot(px - ax - t * dx, py - ay - t * dy)
+
+
+def stroke_centre(s):
+    xs, ys = [p[0] for p in s.pts], [p[1] for p in s.pts]
+    return (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+
+
+def stroke_segments(s):
+    """[(line width, [(p1, c1, c2, p2), ...])]: runs of similar pressure, each one a smooth curve.
+    A Catmull-Rom spline through the pen points, as one cubic bezier per segment."""
+    pts = s.pts
+    if len(pts) == 1:
+        pts = [pts[0], (pts[0][0] + 0.01, pts[0][1], pts[0][2])]
+    n = len(pts)
+    # average each point's pressure with its neighbours, so the width changes gradually
+    pr = [(pts[max(i - 1, 0)][2] + pts[i][2] + pts[min(i + 1, n - 1)][2]) / 3 for i in range(n)]
+
+    def level(i):
+        return round((pr[i] + pr[i + 1]) / 2 * 12)
+
+    runs, i = [], 0
+    while i < n - 1:
+        lv, segs, j = level(i), [], i
+        while j < n - 1 and level(j) == lv:
+            p0, p1, p2 = pts[max(j - 1, 0)], pts[j], pts[j + 1]
+            p3 = pts[min(j + 2, n - 1)]
+            segs.append(((p1[0], p1[1]),
+                         (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6),
+                         (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6),
+                         (p2[0], p2[1])))
+            j += 1
+        runs.append((s.width * (0.4 + lv / 12), segs))
+        i = j
+    return runs
+
+
+def parse_pages(text, total):
+    """'1-3,5' -> [1, 2, 3, 5]. Raises ValueError with a message meant for the user."""
+    out = []
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            a, _, b = part.partition("-")
+            lo, hi = int(a), int(b or a)
+        except ValueError:
+            raise ValueError(f"“{part}” isn't a page number or range") from None
+        if not 1 <= lo <= hi <= total:
+            raise ValueError(f"Pages go from 1 to {total}")
+        out.extend(range(lo, hi + 1))
+    if not out:
+        raise ValueError("Type the pages you want, for example 1-3,5")
+    return out
+
+
+def render_pdf_page(pdf, n):
+    """PNG bytes of page n (1-based) of a PDF, SLIDE_RENDER_WIDTH pixels wide."""
+    with tempfile.TemporaryDirectory(prefix="page-") as d:
+        out = Path(d) / "p"
+        r = subprocess.run(["pdftoppm", "-png", "-singlefile", "-f", str(n), "-l", str(n),
+                            "-scale-to-x", str(SLIDE_RENDER_WIDTH), "-scale-to-y", "-1",
+                            str(pdf), str(out)], capture_output=True, text=True, timeout=120)
+        png = Path(str(out) + ".png")
+        if not png.exists():
+            raise RuntimeError(f"could not render page {n}: {r.stderr.strip()[-120:]}")
+        return png.read_bytes()
+
+
+_pdf_hashes = {}
+
+
+def pdf_member(path):
+    """Name of a PDF inside a saved note: pdfs/<content hash>.pdf (the hash is worked out once)."""
+    path = str(path)
+    if path not in _pdf_hashes:
+        _pdf_hashes[path] = file_sha1(path)
+    return f"pdfs/{_pdf_hashes[path]}.pdf"
+
+
+def ensure_edit_link(md, base):
+    """Make sure a note carries a link that opens it, editable, in Pen Note (works from Obsidian)."""
+    link = f"[Edit in Pen Note](pennote://open/{quote(base, safe='')})"
+    text = md.read_text()
+    if "pennote://open/" in text:
+        new = re.sub(r"\[Edit in Pen Note\]\(pennote://open/[^)]*\)", lambda _: link, text)
+    else:
+        new = text.rstrip("\n") + f"\n\n{link}\n"
+    if new != text:
+        md.write_text(new)
 
 
 def safe_name(name):
@@ -280,7 +377,7 @@ def convert_slides(path, progress=lambda text: None, on_page=None):
     """Turn a PowerPoint/OpenDocument/PDF file into one PNG per slide.
 
     Slow for PowerPoint (LibreOffice needs most of a minute for a big deck), so call it off the UI
-    thread. `progress(text)` reports what it is doing and `on_page(number, total, png_bytes)` is
+    thread. `progress(text)` reports what it is doing and `on_page(number, total, png_bytes, pdf_path)` is
     called for each slide, in order, as soon as that slide is ready (so slides can appear while the
     rest are still rendering). Slides are rendered in parallel, and a deck that was converted before
     comes straight from the cache. Returns the number of slides. Raises RuntimeError."""
@@ -290,16 +387,17 @@ def convert_slides(path, progress=lambda text: None, on_page=None):
         raise RuntimeError("that isn't a PowerPoint, OpenDocument or PDF file")
     key = f"{file_sha1(path)}-{SLIDE_RENDER_WIDTH}"
     cache = CACHE_DIR / key
+    pdf_store = PDF_STORE / f"{key}.pdf"
     if _convert_lock.locked():
         progress("Waiting for the other deck to finish…")
     with _convert_lock:
         done_marker = cache / "complete"
-        if done_marker.exists():                         # converted before: instant
+        if done_marker.exists() and pdf_store.exists():  # converted before: instant
             total = int(done_marker.read_text())
             progress("Found this deck in the cache")
             for i in range(1, total + 1):
                 if on_page:
-                    on_page(i, total, (cache / f"p-{i:03d}.png").read_bytes())
+                    on_page(i, total, (cache / f"p-{i:03d}.png").read_bytes(), str(pdf_store))
             os.utime(cache)                              # most recently used
             return total
 
@@ -345,13 +443,15 @@ def convert_slides(path, progress=lambda text: None, on_page=None):
                     raise RuntimeError(f"could not render slide {i}: {r.stderr.strip()[-120:]}")
                 return png.read_bytes()
 
+            PDF_STORE.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(pdf, pdf_store)             # the page pictures point back to this PDF
             progress(f"Rendering {total} slide{'s' if total != 1 else ''}…")
             pool = ThreadPoolExecutor(max_workers=max(2, min(8, os.cpu_count() or 4)))
             futures = [pool.submit(render, i) for i in range(1, total + 1)]
             for i, fut in enumerate(futures, 1):         # hand over slides in order, as each is ready
                 data = fut.result()
                 if on_page:
-                    on_page(i, total, data)
+                    on_page(i, total, data, str(pdf_store))
             done_marker.write_text(str(total))
             prune_cache()
             return total
@@ -370,18 +470,19 @@ def convert_slides(path, progress=lambda text: None, on_page=None):
 class Item:
     """A picture or a text box. x, y, image width and text size are in world pixels
     (1 world pixel = 1 screen pixel at zoom 1)."""
-    __slots__ = ("kind", "x", "y", "width", "texture", "text", "size", "color", "png", "auto")
+    __slots__ = ("kind", "x", "y", "width", "texture", "text", "size", "color", "png", "auto", "pdf")
 
     def __init__(self, kind, x, y, width=400.0, texture=None, text="", size=24.0,
-                 color=(0.08, 0.08, 0.08), png=None, auto=False):
+                 color=(0.08, 0.08, 0.08), png=None, auto=False, pdf=None):
         self.kind, self.x, self.y = kind, x, y
         self.width, self.texture, self.text, self.size, self.color = width, texture, text, size, color
         self.png = png        # cached PNG bytes of the picture (for saving)
         self.auto = auto      # the screenshot placed automatically: doesn't count as "content"
+        self.pdf = pdf        # (path of the PDF, page index) when this picture is a PDF page
 
     def clone(self):
         return Item(self.kind, self.x, self.y, self.width, self.texture, self.text, self.size,
-                    self.color, self.png, self.auto)
+                    self.color, self.png, self.auto, self.pdf)
 
 
 def run_canvas(screenshot, open_name=None, slides=None, files=()):
@@ -411,44 +512,23 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             Gtk.Widget.do_dispose(self)
 
     class Stroke:
-        __slots__ = ("color", "width", "pts", "cache")
+        __slots__ = ("color", "width", "pts", "cache", "alpha")
 
-        def __init__(self, color, width):
-            self.color, self.width, self.pts = color, width, []  # pts: (x, y, pressure) in world pixels
+        def __init__(self, color, width, alpha=1.0):
+            self.color, self.width, self.alpha, self.pts = color, width, alpha, []  # pts: (x, y, pressure)
             self.cache = None   # (point count, [(path, Gsk.Stroke)]): built once per stroke, not per frame
 
     def stroke_runs(s):
-        """A stroke as runs of similar pressure, each one a smooth curve through the pen points."""
-        pts = s.pts
-        if len(pts) == 1:
-            pts = [pts[0], (pts[0][0] + 0.01, pts[0][1], pts[0][2])]
-        n = len(pts)
-        # average each point's pressure with its neighbours, so the width changes gradually
-        pr = [(pts[max(i - 1, 0)][2] + pts[i][2] + pts[min(i + 1, n - 1)][2]) / 3 for i in range(n)]
-
-        def level(i):
-            return round((pr[i] + pr[i + 1]) / 2 * 12)
-
-        runs, i = [], 0
-        while i < n - 1:
-            lv = level(i)
+        runs = []
+        for width, segs in stroke_segments(s):
             pb = Gsk.PathBuilder.new()
-            pb.move_to(pts[i][0], pts[i][1])
-            j = i
-            while j < n - 1 and level(j) == lv:
-                # Catmull-Rom spline through the real points, drawn as one cubic bezier per segment
-                p0 = pts[max(j - 1, 0)]
-                p1, p2 = pts[j], pts[j + 1]
-                p3 = pts[min(j + 2, n - 1)]
-                pb.cubic_to(p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6,
-                            p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6,
-                            p2[0], p2[1])
-                j += 1
-            stroke = Gsk.Stroke.new(s.width * (0.4 + lv / 12))
+            pb.move_to(*segs[0][0])
+            for _, c1, c2, p2 in segs:
+                pb.cubic_to(*c1, *c2, *p2)
+            stroke = Gsk.Stroke.new(width)
             stroke.set_line_cap(Gsk.LineCap.ROUND)
             stroke.set_line_join(Gsk.LineJoin.ROUND)
             runs.append((pb.to_path(), stroke))
-            i = j
         return runs
 
     def texture_png(item):
@@ -499,12 +579,19 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             """Files chosen with "Open with Pen Note" (also reaches an already open canvas)."""
             self.do_activate()
             for f in files:
-                if f.get_path():
+                uri = f.get_uri() or ""
+                if uri.startswith("pennote:"):               # the "Edit in Pen Note" link in Obsidian
+                    self.open_note(safe_name(Path(unquote(urlparse(uri).path)).name))
+                elif f.get_path():
                     self.open_path(f.get_path())
 
         def open_path(self, p):
             ext = Path(p).suffix.lower()
-            if ext == ".pennote":
+            stem = Path(p).stem
+            if (ext in (".png", ".md") and Path(p).resolve().parent == NOTES_DIR.resolve()
+                    and (PROJECT_DIR / f"{stem}.pennote").exists()):
+                self.open_note(stem)                         # a Pen Note's own picture: edit the note
+            elif ext == ".pennote":
                 self.open_project_file(p)
             elif ext in SLIDE_EXTS:
                 self.add_slide_file(p)
@@ -522,8 +609,12 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.win = win
             win.set_default_size(1100, 760)
 
-            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            win.set_child(root)
+            outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            win.set_child(outer)
+            outer.append(self.build_sidebar())
+            outer.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+            outer.append(root)
 
             def new_bar():
                 bar = Gtk.Box(spacing=6, margin_top=4, margin_bottom=2, margin_start=8, margin_end=8)
@@ -542,13 +633,14 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             bar = new_bar()
             self.name_entry = Gtk.Entry(placeholder_text="Note name (optional)", hexpand=True)
             bar.append(self.name_entry)
-            add_button(bar, "Open", self.on_open, "Open a saved note to continue it")
             add_button(bar, "−", lambda *_: self.zoom_by(1 / 1.4), "Zoom out")
             add_button(bar, "+", lambda *_: self.zoom_by(1.4), "Zoom in")
             add_button(bar, "Fit", lambda *_: self.fit_all(), "Show everything on the surface")
             add_button(bar, "Undo", self.on_undo, "Undo (Ctrl+Z)")
             add_button(bar, "Redo", self.on_redo, "Redo (Ctrl+Shift+Z)")
             add_button(bar, "Clear", self.on_clear, "Remove everything")
+            add_button(bar, "Save PDF", self.on_save_pdf,
+                       "Save as a PDF: opened PDF pages stay sharp, your marks go on top")
             save = add_button(bar, "Save", lambda *_: self.save(notify=True))
             save.add_css_class("suggested-action")
 
@@ -580,7 +672,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             bar.append(size)
 
             self.mode_btns = {}
-            for name, label, tip in (("eraser", "Eraser", "Erase pen strokes"),
+            for name, label, tip in (("highlight", "Highlight", "Yellow highlighter"),
+                                     ("eraser", "Eraser", "Erase pen strokes"),
                                      ("move", "Move", "Select, move and resize pictures and text"),
                                      ("text", "Text", "Tap to add a text box, tap one to edit it")):
                 b = Gtk.ToggleButton(label=label)
@@ -600,7 +693,6 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
             add_button(bar, "Delete", self.on_delete_selected, "Delete the selected picture or text")
             add_button(bar, "Paste", self.on_paste, "Paste a picture from the clipboard (Ctrl+V)")
-            add_button(bar, "Slides", self.on_slides, "Add a PowerPoint, OpenDocument or PDF file: every slide becomes a picture")
             tip = Gtk.Label(label="Drag with a finger to move around · drop pictures or slides here", hexpand=True, xalign=1)
             tip.add_css_class("dim-label")
             bar.append(tip)
@@ -688,6 +780,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.open_note(open_name)
 
             win.present()
+            self.refresh_recent()
             self.area.grab_focus()
             if slides:
                 self.add_slide_file(slides)
@@ -716,6 +809,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             """Always show what the pen will do, so 'it doesn't draw' is never a mystery."""
             self.tool_label.set_text({
                 "pen": "Tool: Draw",
+                "highlight": "Tool: Highlight (yellow, for marking text)",
                 "eraser": "Tool: Eraser (pen strokes only)",
                 "move": "Tool: Move (pen drags pictures and text; pick a color to draw)",
                 "text": "Tool: Text (tap to place; pick a color to draw)",
@@ -732,7 +826,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         def on_color(self, btn, rgb):
             if btn.get_active():
                 self.color = rgb
-                if self.mode in ("eraser", "move"):  # picking a color means "draw"
+                if self.mode in ("eraser", "move", "highlight"):  # picking a color means "draw"
                     self.set_mode("pen")
 
         # ---- undo / redo -----------------------------------------------------
@@ -887,25 +981,91 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             return bool(textures or decks)
 
         # ---- slides ----------------------------------------------------------
-        def on_slides(self, *_):
-            dlg = Gtk.FileDialog(title="Add slides")
+        # ---- left panel: what to open, page tools, recent notes ------------------
+        def build_sidebar(self):
+            side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                           margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+            side.set_size_request(168, -1)
+
+            def head(text):
+                lab = Gtk.Label(label=text, xalign=0, margin_top=10, margin_bottom=2)
+                lab.add_css_class("dim-label")
+                lab.add_css_class("caption-heading")
+                side.append(lab)
+
+            def button(label, cb, tip=None):
+                b = Gtk.Button(label=label)
+                b.add_css_class("flat")
+                b.get_child().set_halign(Gtk.Align.START)
+                b.connect("clicked", cb)
+                if tip:
+                    b.set_tooltip_text(tip)
+                side.append(b)
+
+            head("OPEN")
+            button("Note…", self.on_open, "A note you saved before, to continue it")
+            button("PDF…", lambda *_: self.pick_file("Open a PDF", "PDF", [".pdf"], self.add_slide_file),
+                   "Open a PDF: write on it, highlight, then Save PDF. Open a second one to join them")
+            button("Picture…", lambda *_: self.pick_file(
+                "Add a picture", "Pictures", [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"], self.add_picture_file))
+            button("Slides…", lambda *_: self.pick_file(
+                "Add slides", "PowerPoint, OpenDocument", sorted(SLIDE_EXTS - {".pdf"}), self.add_slide_file),
+                "A PowerPoint or OpenDocument presentation: every slide becomes a PDF page")
+            head("PDF PAGES")
+            button("Rotate page", self.rotate_page, "Turn the selected page (or the one in the middle of the view)")
+            button("Delete page", self.delete_page)
+            button("Move page up", lambda *_: self.move_page(-1))
+            button("Move page down", lambda *_: self.move_page(1))
+            button("Split…", self.on_split, "Save only some pages as a new PDF")
+            head("RECENT")
+            self.recent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            side.append(self.recent_box)
+            sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            sc.set_child(side)
+            return sc
+
+        def refresh_recent(self):
+            box = getattr(self, "recent_box", None)
+            if box is None:
+                return
+            while (child := box.get_first_child()) is not None:
+                box.remove(child)
+            for base, _mtime, _editable in self.list_notes()[:6]:
+                b = Gtk.Button(label=base)
+                b.add_css_class("flat")
+                lab = b.get_child()
+                lab.set_halign(Gtk.Align.START)
+                lab.set_ellipsize(Pango.EllipsizeMode.END)
+                lab.set_max_width_chars(20)
+                b.set_tooltip_text(base)
+                b.connect("clicked", lambda _b, name=base: self.open_note(name))
+                box.append(b)
+
+        def pick_file(self, title, kind, suffixes, callback):
+            dlg = Gtk.FileDialog(title=title)
             flt = Gtk.FileFilter()
-            flt.set_name("Slides (PowerPoint, OpenDocument, PDF)")
-            for ext in sorted(SLIDE_EXTS):
+            flt.set_name(kind)
+            for ext in suffixes:
                 flt.add_suffix(ext[1:])
             store = Gio.ListStore.new(Gtk.FileFilter)
             store.append(flt)
             dlg.set_filters(store)
             dlg.set_default_filter(flt)
-            dlg.open(self.win, None, self.on_slides_chosen)
 
-        def on_slides_chosen(self, dlg, res):
+            def done(d, res):
+                try:
+                    f = d.open_finish(res)
+                except GLib.Error:
+                    return                                   # cancelled
+                if f and f.get_path():
+                    callback(f.get_path())
+            dlg.open(self.win, None, done)
+
+        def add_picture_file(self, path):
             try:
-                f = dlg.open_finish(res)
+                self.add_image(Gdk.Texture.new_from_filename(path))
             except GLib.Error:
-                return                                       # cancelled
-            if f and f.get_path():
-                self.add_slide_file(f.get_path())
+                self.status.set_text(f"Can't open “{Path(path).name}” as a picture.")
 
         def show_progress(self, text):
             self.msgs.append(text)
@@ -931,14 +1091,14 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     n = convert_slides(
                         path,
                         lambda t: GLib.idle_add(self.show_progress, label + t),
-                        lambda i, total, data: GLib.idle_add(self.slide_ready, path, name, i, total, data))
+                        lambda i, total, data, pdf: GLib.idle_add(self.slide_ready, path, name, i, total, data, pdf))
                     err = None
                 except Exception as e:  # noqa: BLE001
                     n, err = 0, str(e)
                 GLib.idle_add(self.slides_done, path, name, n, err, done)
             threading.Thread(target=work, daemon=True).start()
 
-        def slide_ready(self, path, name, i, total, data):
+        def slide_ready(self, path, name, i, total, data, pdf=None):
             """One more slide arrived: show it straight away, below the previous one.
 
             Slides stay 'pending' (visible, but not yet part of the note) until the whole deck is
@@ -960,7 +1120,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 tex = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
                 height = SLIDE_DISPLAY_WIDTH * tex.get_height() / tex.get_width()
                 self.pending[path].append(
-                    Item("image", st["x"], st["y"], width=SLIDE_DISPLAY_WIDTH, texture=tex, png=data))
+                    Item("image", st["x"], st["y"], width=SLIDE_DISPLAY_WIDTH, texture=tex, png=data,
+                         pdf=(pdf, i - 1) if pdf else None))
                 st["y"] += height * (1 + SLIDE_GAP_RATIO)
                 self.show_progress(f"“{name}”: slide {i} of {total} ready" + ("" if i < total else "."))
                 self.area.queue_draw()
@@ -1119,7 +1280,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             else:
                 self.push_undo()
                 # divide by zoom so the pen keeps the same size on screen whatever the zoom
-                self.current = Stroke(self.color, self.pen_px * 1.1 / self.zoom)
+                if self.mode == "highlight":
+                    self.current = Stroke(HIGHLIGHT, 16 * 1.1 / self.zoom, 0.4)
+                    pressure = 0.5                         # a highlighter has one width
+                else:
+                    self.current = Stroke(self.color, self.pen_px * 1.1 / self.zoom)
                 self.current.pts.append((wx, wy, pressure))
                 self.strokes.append(self.current)
             self.area.queue_draw()
@@ -1135,7 +1300,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             if tool == "erase":
                 self.erase_at(wx, wy)
             elif self.current:
-                self.current.pts.append((wx, wy, pressure))
+                self.current.pts.append((wx, wy, 0.5 if self.current.alpha < 1 else pressure))
             self.area.queue_draw()
 
         def finish(self):
@@ -1255,7 +1420,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             for s in self.strokes:
                 rgba = Gdk.RGBA()
                 rgba.red, rgba.green, rgba.blue = s.color
-                rgba.alpha = 1.0
+                rgba.alpha = s.alpha
                 if s.cache is None or s.cache[0] != len(s.pts):    # only the stroke being drawn changes
                     s.cache = (len(s.pts), stroke_runs(s))
                 for path, stroke in s.cache[1]:
@@ -1295,6 +1460,13 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             return (x0 - EXPORT_MARGIN, y0 - EXPORT_MARGIN,
                     x1 - x0 + 2 * EXPORT_MARGIN, y1 - y0 + 2 * EXPORT_MARGIN)
 
+        def get_renderer(self):
+            if self.export_renderer is None:
+                renderer = Gsk.CairoRenderer.new()
+                renderer.realize_for_display(Gdk.Display.get_default())
+                self.export_renderer = renderer
+            return self.export_renderer
+
         def render_png(self, path):
             """Draw everything on the surface, cropped, with GTK's renderer and save it."""
             bx, by, bw, bh = self.content_bounds()
@@ -1310,16 +1482,300 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             node = snap.to_node()
             # A private offscreen renderer: the window's own renderer was missing in a long-lived
             # session ("'NoneType' object has no attribute 'render_texture'"), which broke saving.
-            if self.export_renderer is None:
-                renderer = Gsk.CairoRenderer.new()
-                renderer.realize_for_display(Gdk.Display.get_default())
-                self.export_renderer = renderer
-            texture = self.export_renderer.render_texture(node, Graphene.Rect().init(0, 0, iw, ih))
+            texture = self.get_renderer().render_texture(node, Graphene.Rect().init(0, 0, iw, ih))
             tmp = f"{path}.tmp"                      # write aside, then swap in: never a half-written PNG
             if not texture.save_to_png(tmp):
                 raise OSError("could not write the PNG")
             os.replace(tmp, path)
             return iw, ih
+
+        # ---- PDF: pages, page tools, saving as PDF -------------------------------
+        def pdf_pages(self):
+            """PDF page pictures in document order: columns left to right, top to bottom."""
+            return sorted((i for i in self.items if i.kind == "image" and i.pdf),
+                          key=lambda i: (round(i.x), i.y))
+
+        def target_page(self):
+            """The page a page tool acts on: the selected one, else the one nearest the view centre."""
+            pages = self.pdf_pages()
+            if not pages:
+                self.status.set_text("Open a PDF first (left panel: PDF…).")
+                return None
+            if self.selected in pages:
+                return self.selected
+            w, h = self.canvas_size()
+            cx, cy = self.to_world(w / 2, h / 2)
+
+            def away(i):
+                bx, by, bw, bh = self.item_box(i)
+                return math.hypot(bx + bw / 2 - cx, by + bh / 2 - cy)
+            return min(pages, key=away)
+
+        def transform_marks(self, rules):
+            """rules = [(rect, f)]. Strokes and text whose centre is inside a rect are moved by
+            f(x, y) -> (x, y). Each mark follows the first rect that holds it, judged before any move."""
+            def rule_for(px, py):
+                for (x, y, w, h), f in rules:
+                    if x <= px <= x + w and y <= py <= y + h:
+                        return f
+                return None
+            marks = []
+            for st in self.strokes:
+                f = rule_for(*stroke_centre(st))
+                if f:
+                    moved = Stroke(st.color, st.width, st.alpha)
+                    moved.pts = [(*f(px, py), pr) for px, py, pr in st.pts]
+                    st = moved
+                marks.append(st)
+            self.strokes = marks
+            for it in self.items:
+                f = rule_for(it.x, it.y) if it.kind == "text" else None
+                if f:
+                    it.x, it.y = f(it.x, it.y)
+
+        def delete_page(self, *_):
+            it = self.target_page()
+            if it is None:
+                return
+            x, y, w, h = self.item_box(it)
+            self.push_undo()
+
+            def inside(px, py):
+                return x <= px <= x + w and y <= py <= y + h
+            self.strokes = [st for st in self.strokes if not inside(*stroke_centre(st))]
+            self.items = [i for i in self.items
+                          if i is not it and not (i.kind == "text" and inside(i.x, i.y))]
+            below = [p for p in self.pdf_pages() if abs(p.x - it.x) < 1 and p.y > it.y]
+            if below:                                        # pull the pages underneath up
+                dy = it.y - below[0].y
+                self.transform_marks([(self.item_box(p), lambda px, py: (px, py + dy)) for p in below])
+                for p in below:
+                    p.y += dy
+            self.selected = None
+            self.status.set_text("Page deleted. Undo brings it back.")
+            self.area.queue_draw()
+
+        def move_page(self, step):
+            it = self.target_page()
+            if it is None:
+                return
+            col = [p for p in self.pdf_pages() if abs(p.x - it.x) < 1]
+            j = col.index(it) + step
+            if not 0 <= j < len(col):
+                self.status.set_text("That page is already " + ("first." if step < 0 else "last."))
+                return
+            a, b = (col[j], it) if step < 0 else (it, col[j])      # a is above b
+            ra, rb = self.item_box(a), self.item_box(b)
+            gap = b.y - (a.y + ra[3])
+            da, db = rb[3] + gap, a.y - b.y                        # a goes down, b goes up
+            self.push_undo()
+            self.transform_marks([(ra, lambda px, py: (px, py + da)), (rb, lambda px, py: (px, py + db))])
+            a.y, b.y = a.y + da, b.y + db
+            self.status.set_text("Page moved.")
+            self.area.queue_draw()
+
+        def rotate_page(self, *_):
+            it = self.target_page()
+            if it is None:
+                return
+            from pypdf import PdfWriter
+            src, idx = it.pdf
+            try:
+                writer = PdfWriter(clone_from=src)
+                writer.pages[idx].rotate(90)
+                PDF_STORE.mkdir(parents=True, exist_ok=True)
+                tmp = PDF_STORE / f"rot-{os.getpid()}-{time.time_ns()}.pdf"
+                with open(tmp, "wb") as f:
+                    writer.write(f)
+                new = PDF_STORE / f"{file_sha1(tmp)}.pdf"
+                os.replace(tmp, new)
+                png = render_pdf_page(new, idx + 1)
+            except Exception as e:  # noqa: BLE001
+                log("rotate failed:", e)
+                self.status.set_text(f"Could not rotate: {e}")
+                return
+            x, y, w, h = self.item_box(it)
+            self.push_undo()
+            # a clockwise quarter turn: a point u across and v down the page lands h - v across, u down
+            self.transform_marks([((x, y, w, h), lambda px, py: (x + h - (py - y), y + (px - x)))])
+            it.texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(png))
+            it.png, it.pdf, it.width = png, (str(new), idx), h
+            self.status.set_text("Page turned. Undo turns it back.")
+            self.area.queue_draw()
+
+        def on_split(self, *_):
+            pages = self.pdf_pages()
+            if not pages:
+                self.status.set_text("Open a PDF first (left panel: PDF…).")
+                return
+            dlg = Gtk.Window(title="Split", transient_for=self.win, modal=True, default_width=340)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                          margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+            msg = Gtk.Label(label=f"This PDF has {len(pages)} pages. Which of them go into the new file?\n"
+                                  "For example 1-3,5", xalign=0)
+            entry = Gtk.Entry(placeholder_text="1-3,5", activates_default=True)
+            ok = Gtk.Button(label="Choose where to save…")
+            ok.add_css_class("suggested-action")
+
+            def go(*_):
+                try:
+                    chosen = parse_pages(entry.get_text(), len(pages))
+                except ValueError as e:
+                    msg.set_text(str(e))
+                    return
+                dlg.close()
+                self.ask_pdf_path(chosen)
+            ok.connect("clicked", go)
+            entry.connect("activate", go)
+            for w in (msg, entry, ok):
+                box.append(w)
+            dlg.set_child(box)
+            dlg.present()
+
+        def on_save_pdf(self, *_):
+            self.ask_pdf_path(None)
+
+        def ask_pdf_path(self, only):
+            if not (self.strokes or self.items):
+                self.status.set_text("Nothing to save yet.")
+                return
+            dlg = Gtk.FileDialog(title="Save as PDF" if not only else "Save the chosen pages as PDF")
+            name = safe_name(self.name_entry.get_text()) or self.saved_base or "Pen note"
+            dlg.set_initial_name(f"{name}{'' if not only else ' (part)'}.pdf")
+            if NOTES_DIR.is_dir():
+                dlg.set_initial_folder(Gio.File.new_for_path(str(NOTES_DIR)))
+
+            def done(d, res):
+                try:
+                    f = d.save_finish(res)
+                except GLib.Error:
+                    return                                   # cancelled
+                path = Path(f.get_path())
+                if path.suffix.lower() != ".pdf":
+                    path = path.with_name(path.name + ".pdf")
+                try:
+                    self.export_pdf(path, only)
+                    self.status.set_text(f"Saved PDF: {path}")
+                except Exception as e:  # noqa: BLE001
+                    log("pdf export failed:", e)
+                    self.status.set_text(f"PDF failed: {e}")
+            dlg.save(self.win, None, done)
+
+        def marks_in(self, rect):
+            """True if any stroke or text sits on the rectangle (so a PDF page needs an overlay)."""
+            x, y, w, h = rect
+            for st in self.strokes:
+                xs, ys = [p[0] for p in st.pts], [p[1] for p in st.pts]
+                if min(xs) <= x + w and max(xs) >= x and min(ys) <= y + h and max(ys) >= y:
+                    return True
+            for it in self.items:
+                if it.kind == "text":
+                    bx, by, bw, bh = self.item_box(it)
+                    if bx <= x + w and bx + bw >= x and by <= y + h and by + bh >= y:
+                        return True
+            return False
+
+        def draw_cairo(self, ctx, rect, images):
+            """Draw strokes and text (and pictures, if asked) into a cairo context set up in world
+            pixels, clipped to rect. Strokes stay vector lines; text goes in as a sharp image."""
+            import cairo
+            x, y, w, h = rect
+            ctx.save()
+            ctx.rectangle(x, y, w, h)
+            ctx.clip()
+            if images:
+                for it in self.items:
+                    if it.kind == "image":
+                        surf = cairo.ImageSurface.create_from_png(io.BytesIO(texture_png(it)))
+                        bx, by, bw, _ = self.item_box(it)
+                        ctx.save()
+                        ctx.translate(bx, by)
+                        ctx.scale(bw / surf.get_width(), bw / surf.get_width())
+                        ctx.set_source_surface(surf, 0, 0)
+                        ctx.paint()
+                        ctx.restore()
+            ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
+            for st in self.strokes:
+                ctx.set_source_rgba(*st.color, st.alpha)
+                for width, segs in stroke_segments(st):
+                    ctx.set_line_width(width)
+                    ctx.move_to(*segs[0][0])
+                    for _, c1, c2, p2 in segs:
+                        ctx.curve_to(*c1, *c2, *p2)
+                    ctx.stroke()
+            for it in self.items:
+                if it.kind != "text":
+                    continue
+                scale = 4.0                                        # text pictured at 4x: sharp when printed
+                bx, by, bw, bh = self.item_box(it)
+                snap = Gtk.Snapshot()
+                snap.scale(scale, scale)
+                rgba = Gdk.RGBA()
+                rgba.red, rgba.green, rgba.blue = it.color
+                rgba.alpha = 1.0
+                snap.append_layout(self.make_layout(it), rgba)
+                tex = self.get_renderer().render_texture(
+                    snap.to_node(), Graphene.Rect().init(0, 0, math.ceil(bw * scale) + 4, math.ceil(bh * scale) + 4))
+                surf = cairo.ImageSurface.create_from_png(io.BytesIO(tex.save_to_png_bytes().get_data()))
+                ctx.save()
+                ctx.translate(it.x, it.y)
+                ctx.scale(1 / scale, 1 / scale)
+                ctx.set_source_surface(surf, 0, 0)
+                ctx.paint()
+                ctx.restore()
+            ctx.restore()
+
+        def export_pdf(self, path, only=None):
+            """Opened PDF pages are kept as they are (text stays real text) with the marks laid on
+            top. With no PDF open, the whole surface becomes one page. `only` = page numbers to keep."""
+            import cairo
+            from pypdf import PdfReader, PdfWriter
+            pages = self.pdf_pages()
+            if not pages:
+                return self.export_canvas_pdf(path)
+            if only:
+                pages = [pages[n - 1] for n in only]
+            readers, writer = {}, PdfWriter()
+            for it in pages:
+                src, idx = it.pdf
+                if src not in readers:
+                    readers[src] = PdfReader(src)
+                page = readers[src].pages[idx]
+                page.transfer_rotation_to_content()                # so the marks need no rotation maths
+                box = self.item_box(it)
+                if self.marks_in(box):
+                    media, crop = page.mediabox, page.cropbox
+                    k = float(crop.width) / box[2]                 # points per world pixel
+                    buf = io.BytesIO()
+                    surf = cairo.PDFSurface(buf, float(media.width), float(media.height))
+                    ctx = cairo.Context(surf)
+                    ctx.translate(float(crop.left - media.left), float(media.top - crop.top))
+                    ctx.scale(k, k)
+                    ctx.translate(-box[0], -box[1])
+                    self.draw_cairo(ctx, box, images=False)
+                    surf.finish()
+                    page.merge_page(PdfReader(io.BytesIO(buf.getvalue())).pages[0])
+                writer.add_page(page)
+            tmp = f"{path}.tmp"
+            with open(tmp, "wb") as f:
+                writer.write(f)
+            os.replace(tmp, path)
+
+        def export_canvas_pdf(self, path):
+            import cairo
+            bx, by, bw, bh = self.content_bounds()
+            k = min(0.75, 14000 / max(bw, bh))                     # 96 px per inch, within the PDF page limit
+            tmp = f"{path}.tmp"
+            surf = cairo.PDFSurface(tmp, bw * k, bh * k)
+            ctx = cairo.Context(surf)
+            ctx.scale(k, k)
+            ctx.translate(-bx, -by)
+            ctx.set_source_rgb(1, 1, 1)
+            ctx.paint()
+            self.draw_cairo(ctx, (bx, by, bw, bh), images=True)
+            surf.finish()
+            os.replace(tmp, path)
 
         # ---- saving and opening ------------------------------------------------
         def has_content(self):
@@ -1333,13 +1789,18 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 for n, it in enumerate(self.items):
                     d = {"kind": it.kind, "x": it.x, "y": it.y, "width": it.width,
                          "text": it.text, "size": it.size, "color": list(it.color), "auto": it.auto}
+                    if it.pdf:                          # the original PDF travels with the note
+                        name = pdf_member(it.pdf[0])
+                        if name not in zf.namelist():
+                            zf.write(it.pdf[0], name, compress_type=zipfile.ZIP_STORED)
+                        d["pdf"] = {"file": name, "page": it.pdf[1]}
                     if it.kind == "image":
                         d["image"] = f"images/{n}.png"
                         zf.writestr(d["image"], texture_png(it))
                     items.append(d)
                 state = {"version": 1,
                          "view": {"zoom": self.zoom, "ox": self.ox, "oy": self.oy},
-                         "strokes": [{"color": list(s.color), "width": s.width,
+                         "strokes": [{"color": list(s.color), "width": s.width, "alpha": s.alpha,
                                       "pts": [list(p) for p in s.pts]} for s in self.strokes],
                          "items": items}
                 zf.writestr("state.json", json.dumps(state))
@@ -1351,13 +1812,19 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 state = json.loads(zf.read("state.json"))
                 strokes = []
                 for sd in state["strokes"]:
-                    s = Stroke(tuple(sd["color"]), sd["width"])
+                    s = Stroke(tuple(sd["color"]), sd["width"], sd.get("alpha", 1.0))
                     s.pts = [tuple(p) for p in sd["pts"]]
                     strokes.append(s)
                 items = []
                 for d in state["items"]:
                     it = Item(d["kind"], d["x"], d["y"], width=d["width"], text=d["text"],
                               size=d["size"], color=tuple(d["color"]), auto=d.get("auto", False))
+                    if "pdf" in d:
+                        PDF_STORE.mkdir(parents=True, exist_ok=True)
+                        out = PDF_STORE / Path(d["pdf"]["file"]).name
+                        if not out.exists():
+                            out.write_bytes(zf.read(d["pdf"]["file"]))
+                        it.pdf = (str(out), d["pdf"]["page"])
                     if d["kind"] == "image":
                         data = zf.read(d["image"])
                         it.png = data
@@ -1441,6 +1908,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.set_mode("pen")
             self.set_view(*view)
             self.win.set_title(f"Pen Note: {base}" if base else "Pen Note")
+            self.refresh_recent()
 
         def open_project_file(self, p):
             """Open a .pennote file. One from the vault continues that note; any other is a copy
@@ -1506,6 +1974,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         "---\n\n"
                         f"![[{base}.png]]\n")
 
+                ensure_edit_link(md, base)
                 if old and old != base:                      # drop the old name's files
                     for f in (NOTES_DIR / f"{old}.md", NOTES_DIR / f"{old}.png",
                               PROJECT_DIR / f"{old}.pennote"):
@@ -1514,6 +1983,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.dirty = False
                 self.win.set_title(f"Pen Note: {base}")
                 self.status.set_text(f"Saved: Pen Notes/{base}")
+                self.refresh_recent()
                 return True
             except Exception as e:  # noqa: BLE001
                 log("save failed:", e)
