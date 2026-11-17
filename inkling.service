@@ -1,10 +1,10 @@
 [Unit]
-Description=Pen Note: double-tap the pen to open a drawing canvas
+Description=Inkling: double-tap the pen to open a drawing canvas
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=/usr/bin/python3 %h/pen-note/pen_note.py daemon
+ExecStart=/usr/bin/python3 %h/inkling/inkling.py daemon
 Restart=on-failure
 RestartSec=3
 

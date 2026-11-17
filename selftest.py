@@ -1,4 +1,4 @@
-"""Pen Note's self-test: run with PEN_NOTE_SELFTEST=<mode> PEN_NOTE_DIR=<scratch folder> pen_note.py canvas.
+"""Inkling's self-test: run with PEN_NOTE_SELFTEST=<mode> PEN_NOTE_DIR=<scratch folder> inkling.py canvas.
 
 Needs a display. PEN_NOTE_DIR is required: the test saves, renames and deletes notes there."""
 import json
@@ -16,12 +16,12 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Gdk, GLib, Graphene, Gtk  # noqa: E402
 
-from pen_note import (EXPORT_MAX_PIXELS, PAGE_TEXTURES, PDF_STORE, Item, migrate_page, EXPORT_MAX_SIDE, NOTES_DIR, PROJECT_DIR,  # noqa: E402
+from inkling import (EXPORT_MAX_PIXELS, PAGE_TEXTURES, PDF_STORE, Item, migrate_page, EXPORT_MAX_SIDE, NOTES_DIR, PROJECT_DIR,  # noqa: E402
                       SLIDE_GAP_RATIO, WORK_DIR, log)
 
 def strip_link(text):
-    """The note without the 'Edit in Pen Note' line that every save adds."""
-    return re.sub(r"\n\n\[Edit in Pen Note\]\([^)]*\)\n$", "\n", text)
+    """The note without the 'Edit in Inkling' line that every save adds."""
+    return re.sub(r"\n\n\[Edit in (?:Pen Note|Inkling)\]\([^)]*\)\n$", "\n", text)
 
 
 def pixels(pdf, page, dpi=40):
@@ -553,7 +553,7 @@ def run(self):
     if mode == "pdfsecure":
         import cairo
         from pypdf import PdfReader, PdfWriter
-        from pen_note import PasswordNeeded, check_signature, convert_slides, make_certificate, sign_pdf
+        from inkling import PasswordNeeded, check_signature, convert_slides, make_certificate, sign_pdf
         d = tempfile.mkdtemp()
         os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"               # never touch the real saved signature or certificate
         raw, locked = f"{d}/raw.pdf", f"{d}/locked.pdf"

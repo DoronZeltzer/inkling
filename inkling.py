@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Pen Note: double-tap the pen on the screen to open a boundless canvas.
+"""Inkling: double-tap the pen on the screen to open a boundless canvas.
 
-  pen_note.py daemon                 watch the pen, open the canvas on a double tap
-  pen_note.py canvas [--screenshot FILE] [--open NAME] [FILE ...]
+  inkling.py daemon                 watch the pen, open the canvas on a double tap
+  inkling.py canvas [--screenshot FILE] [--open NAME] [FILE ...]
                                      open the canvas directly (also used by the daemon and
-                                     "Open with Pen Note": .pennote notes, pictures, slides)
+                                     "Open with Inkling": .pennote notes, pictures, slides)
 
 Each save writes, into the Obsidian vault: a PNG of everything on the canvas, a markdown
-note that embeds it (with an "Edit in Pen Note" link), and a hidden editable copy so the note
+note that embeds it (with an "Edit in Inkling" link), and a hidden editable copy so the note
 can be opened and continued. "Save PDF" keeps opened PDF pages sharp and puts your marks on top.
 
 Needs: python3-gi with GTK4 and python3-gi-cairo, poppler-utils (pdftoppm, pdftotext, pdfinfo),
@@ -131,13 +131,13 @@ def take_screenshot():
         return None
     src = Path(unquote(urlparse(result["res"]["uri"]).path))
     run_dir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
-    dst = run_dir / f"pen-note-shot-{int(time.time())}.png"
+    dst = run_dir / f"inkling-shot-{int(time.time())}.png"
     shutil.move(str(src), str(dst))  # keep ~/Pictures clean
     return dst
 
 
 def canvas_running():
-    """True if any Pen Note canvas is open, however it was started (double tap, dock, terminal)."""
+    """True if any Inkling canvas is open, however it was started (double tap, dock, terminal)."""
     me = os.getpid()
     for p in Path("/proc").iterdir():
         if not p.name.isdigit() or int(p.name) == me:
@@ -146,7 +146,7 @@ def canvas_running():
             args = (p / "cmdline").read_bytes().split(b"\0")
         except OSError:
             continue
-        if any(a.endswith(b"pen_note.py") for a in args) and b"canvas" in args:
+        if any(a.endswith(b"inkling.py") for a in args) and b"canvas" in args:
             return True
     return False
 
@@ -555,11 +555,11 @@ def pdf_member(path):
 
 
 def ensure_edit_link(md, base):
-    """Make sure a note carries a link that opens it, editable, in Pen Note (works from Obsidian)."""
-    link = f"[Edit in Pen Note](pennote://open/{quote(base, safe='')})"
+    """Make sure a note carries a link that opens it, editable, in Inkling (works from Obsidian)."""
+    link = f"[Edit in Inkling](pennote://open/{quote(base, safe='')})"
     text = md.read_text()
     if "pennote://open/" in text:
-        new = re.sub(r"\[Edit in Pen Note\]\(pennote://open/[^)]*\)", lambda _: link, text)
+        new = re.sub(r"\[Edit in (?:Pen Note|Inkling)\]\(pennote://open/[^)]*\)", lambda _: link, text)
     else:
         new = text.rstrip("\n") + f"\n\n{link}\n"
     if new != text:
@@ -591,7 +591,7 @@ def convert_slides(path, progress=lambda text: None, on_page=None, password=None
     `on_page(number, total, ratio, pdf_path)` is called for each page, in order (ratio = height / width).
     The pages themselves are drawn later, as they come into view. A file that was converted before
     comes straight from the store. A password-protected PDF needs `password` (PasswordNeeded otherwise);
-    its pages are then used from an unlocked copy that is cleared the next time Pen Note starts.
+    its pages are then used from an unlocked copy that is cleared the next time Inkling starts.
     Returns the number of pages. Raises RuntimeError."""
     path = Path(path)
     ext = path.suffix.lower()
@@ -900,11 +900,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         # ---- window ---------------------------------------------------------
         def do_open(self, files, n_files, hint):
-            """Files chosen with "Open with Pen Note" (also reaches an already open canvas)."""
+            """Files chosen with "Open with Inkling" (also reaches an already open canvas)."""
             self.do_activate()
             for f in files:
                 uri = f.get_uri() or ""
-                if uri.startswith("pennote:"):               # the "Edit in Pen Note" link in Obsidian
+                if uri.startswith("pennote:"):               # the "Edit in Inkling" link in Obsidian
                     self.open_note(safe_name(Path(unquote(urlparse(uri).path)).name))
                 elif f.get_path():
                     self.open_path(f.get_path())
@@ -914,7 +914,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             stem = Path(p).stem
             if (ext in (".png", ".md") and Path(p).resolve().parent == NOTES_DIR.resolve()
                     and (PROJECT_DIR / f"{stem}.pennote").exists()):
-                self.open_note(stem)                         # a Pen Note's own picture: edit the note
+                self.open_note(stem)                         # an Inkling note's own picture: edit the note
             elif ext == ".pennote":
                 self.open_project_file(p)
             elif ext in SLIDE_EXTS:
@@ -2828,7 +2828,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.status.set_text("Nothing to export yet.")
                 return
             label = dict(EXPORT_FORMATS)[fmt]
-            name = safe_name(self.name_entry.get_text()) or self.saved_base or "Pen note"
+            name = safe_name(self.name_entry.get_text()) or self.saved_base or "Inkling note"
             dlg = Gtk.FileDialog(title=f"Export as {label}")
             if NOTES_DIR.is_dir():
                 dlg.set_initial_folder(Gio.File.new_for_path(str(NOTES_DIR)))
@@ -3018,7 +3018,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return
             dlg = Gtk.FileDialog(title="Save as PDF, digitally signed" if sign else
                                  "Save as PDF" if not only else "Save the chosen pages as PDF")
-            name = safe_name(self.name_entry.get_text()) or self.saved_base or "Pen note"
+            name = safe_name(self.name_entry.get_text()) or self.saved_base or "Inkling note"
             dlg.set_initial_name(f"{name}{'' if not only else ' (part)'}.pdf")
             if NOTES_DIR.is_dir():
                 dlg.set_initial_folder(Gio.File.new_for_path(str(NOTES_DIR)))
@@ -3419,7 +3419,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.show_note(strokes, items, view, None)
             self.name_entry.set_text(safe_name(p.stem))
             self.dirty = True                                # not in the vault yet: Save/close writes it
-            self.status.set_text(f"Opened “{p.name}”. Save adds it to your Pen Notes.")
+            self.status.set_text(f"Opened “{p.name}”. Save adds it to your notes.")
 
         def unique_base(self, wanted):
             base, n = wanted, 2
@@ -3445,7 +3445,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 elif self.saved_base:
                     wanted = self.saved_base
                 else:
-                    wanted = f"Pen note {stamp}"
+                    wanted = f"Inkling note {stamp}"
                 base = self.unique_base(wanted) if wanted != self.saved_base else wanted
                 old = self.saved_base
 
