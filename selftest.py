@@ -1,6 +1,7 @@
 """Pen Note's self-test: run with PEN_NOTE_SELFTEST=<mode> PEN_NOTE_DIR=<scratch folder> pen_note.py canvas.
 
 Needs a display. PEN_NOTE_DIR is required: the test saves, renames and deletes notes there."""
+import json
 import os
 import re
 import shutil
@@ -157,11 +158,15 @@ def run(self):
             self.export_pdf(big)
             log("selftest slides3 export: all pages are in the saved PDF:", len(PdfReader(big).pages) == 400,
                 "| took %.1fs" % (time.monotonic() - t1))
+            self.add_slide_file(pdfp)                                    # the same file again: jumps to its tab
+            log("selftest tabs: opening the same file again jumps to its tab, no second copy:",
+                len(self.docs) == 1 and len(pics()) == 400)
+            self.close_tab(self.cur)                                     # closed (saved as a note); open it again
             t2 = time.monotonic()
 
             def after_second():
                 took = time.monotonic() - t2
-                log("selftest slides3 cache: second add of the same file: pages now:", len(pics()),
+                log("selftest slides3 cache: opened again after closing: pages:", len(pics()) == 400,
                     "| took %.1fs" % took, "| served from cache:", any("cache" in m for m in self.msgs),
                     "| stored pdfs:", len(list(PDF_STORE.glob("*.pdf"))) >= 1)
 
@@ -373,11 +378,132 @@ def run(self):
             return False
         GLib.timeout_add(500, first)
         return False
+    if mode == "export":
+        import cairo
+        import zipfile
+        d = tempfile.mkdtemp()
+        src = f"{d}/doc.pdf"
+        surf = cairo.PDFSurface(src, 595, 842)
+        c = cairo.Context(surf)
+        for n in (1, 2):
+            c.set_font_size(40)
+            c.move_to(80, 200)
+            c.show_text(f"Export page {n}")
+            surf.show_page()
+        surf.finish()
+        out = {fmt: Path(d) / f"out.{fmt}" for fmt in ("docx", "pptx", "odt", "odp", "txt")}
+        out["png"] = Path(d) / "pics"
+        out["png"].mkdir()
+        todo = ["docx", "pptx", "odt", "odp", "txt", "png"]
+        results = {}
+
+        def next_one(err=None, msg=""):
+            if results or err or msg:
+                results[todo[len(results)]] = (err, msg)
+            if len(results) < len(todo):
+                fmt = todo[len(results)]
+                self.run_export(fmt, out[fmt], "doc", done=next_one)
+                return
+            log("selftest export (errors, if any):", {k: v[0] for k, v in results.items() if v[0]})
+            if not (shutil.which("libreoffice") or shutil.which("soffice")):
+                said = all("LibreOffice" in (results[f][0] or "") and "sudo snap install" in results[f][0]
+                           for f in ("docx", "pptx", "odt", "odp"))
+                log("selftest export: LibreOffice is missing, so Word/PowerPoint/OpenDocument say how to get it:", said,
+                    "| plain text:", results["txt"][0] is None and "Export page 2" in out["txt"].read_text(),
+                    "| pictures (one per page):", results["png"][0] is None and len(list(out["png"].glob("doc-*.png"))) == 2)
+                shutil.rmtree(d, ignore_errors=True)
+                self.win.close()
+                return
+            ok = lambda f: results[f][0] is None
+            log("selftest export: Word:", ok("docx") and "Export page 1" in zipfile.ZipFile(out["docx"]).read("word/document.xml").decode()
+                and "Export page 2" in zipfile.ZipFile(out["docx"]).read("word/document.xml").decode(),
+                "| PowerPoint (2 slides, with the text):", ok("pptx") and len([n for n in zipfile.ZipFile(out["pptx"]).namelist()
+                if n.startswith("ppt/slides/slide") and n.endswith(".xml")]) == 2)
+            log("selftest export: OpenDocument text:", ok("odt") and "Export page 1" in zipfile.ZipFile(out["odt"]).read("content.xml").decode(),
+                "| OpenDocument slides:", ok("odp") and zipfile.ZipFile(out["odp"]).read("content.xml").decode().count("<draw:page ") == 2,
+                "| plain text:", ok("txt") and "Export page 2" in out["txt"].read_text(),
+                "| pictures (one per page):", ok("png") and len(list(out["png"].glob("doc-*.png"))) == 2)
+            log("selftest export: no temporary files left behind:", not list(PDF_STORE.glob("prot-export-*.pdf")))
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+
+        def opened():
+            next_one()
+        self.add_slide_file(src, done=opened)
+        return False
+    if mode == "tabs":
+        import cairo
+        d = tempfile.mkdtemp()
+        os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"
+        files = {}
+        for name, pages in (("a", 2), ("b", 3), ("c", 1)):
+            files[name] = f"{d}/{name}.pdf"
+            surf = cairo.PDFSurface(files[name], 595, 842)
+            c = cairo.Context(surf)
+            for n in range(pages):
+                c.set_font_size(40)
+                c.move_to(80, 200)
+                c.show_text(f"{name} page {n + 1}")
+                surf.show_page()
+            surf.finish()
+
+        def pages():
+            return len([i for i in self.items if i.kind == "image" and i.pdf])
+
+        def after_a():
+            log("selftest tabs: the first file used the empty tab:", len(self.docs) == 1 and self.cur.source == files["a"]
+                and self.doc_title(self.cur) == "a" and pages() == 2)
+            line(100, 100, 300, 150)
+            self.set_view(0.7, 20, 30)
+            log("selftest tabs: drawing marks the tab as unsaved (a dot):", self.tab_buttons[self.cur].get_label().startswith("•"))
+            self.add_slide_file(files["b"], done=after_b)
+
+        def after_b():
+            log("selftest tabs: a second file opens in its own tab:", len(self.docs) == 2 and self.cur.source == files["b"]
+                and pages() == 3 and not self.strokes and "b" in self.win.get_title())
+            self.switch_to(self.docs[0])
+            log("selftest tabs: jumping back finds the first tab exactly as it was (pages, stroke, view):",
+                pages() == 2 and len(self.strokes) == 1 and abs(self.zoom - 0.7) < 1e-9 and (self.ox, self.oy) == (20, 30))
+            self.switch_to(self.docs[1])
+            self.add_slide_file(files["c"], new_tab=False, done=after_join)
+
+        def after_join():
+            log("selftest tabs: 'join another PDF' adds to the same tab:", len(self.docs) == 2 and pages() == 4)
+            self.add_slide_file(files["a"])
+            log("selftest tabs: opening an open file jumps to its tab:", len(self.docs) == 2 and self.cur.source == files["a"])
+            self.on_new_tab()
+            log("selftest tabs: a new note is a blank tab:", len(self.docs) == 3 and self.is_blank(self.cur))
+            self.close_tab(self.docs[1])                                    # saved as a note, tab gone
+            kept = list(NOTES_DIR.glob("*.md"))
+            log("selftest tabs: closing a tab keeps what was in it as a note and removes the tab:",
+                len(self.docs) == 2 and len(kept) >= 1)
+            base = sorted(m.stem for m in kept)[0]
+            self.open_note(base)
+            log("selftest tabs: a saved note opens in the empty tab (no extra tab):", len(self.docs) == 2
+                and self.saved_base == base and pages() == 4)
+            self.close_tab(self.docs[0])
+            self.close_tab(self.docs[0])
+            log("selftest tabs: closing the last tab leaves one empty tab:", len(self.docs) == 1 and self.is_blank(self.cur))
+
+            # the side panel: hide, show, resize, remembered
+            self.paned.set_position(280)
+            self.nav_btn.set_active(False)
+            hidden = not self.sidebar.get_visible()
+            self.nav_btn.set_active(True)
+            saved = json.loads((Path(d) / "cfg" / "window.json").read_text())
+            log("selftest panel: the button hides it, shows it again at the width it had:", hidden and self.sidebar.get_visible()
+                and abs(self.paned.get_position() - 280) < 3, "| width remembered:", saved["nav_width"] == 280)
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+            return False
+
+        self.add_slide_file(files["a"], done=after_a)
+        return False
     if mode == "dialogs":
         os.environ["PEN_NOTE_CONFIG"] = tempfile.mkdtemp()
         self.commit_text(None, (50, 50), "something to sign")
         before = len(Gtk.Window.list_toplevels())
-        self.ask_password("/tmp/x.pdf", "x.pdf", None, True)
+        self.ask_password(self.cur, "/tmp/x.pdf", "x.pdf", None, True)
         self.on_create_certificate(lambda *a: None)
         self.on_sign_digitally()
         opened = len(Gtk.Window.list_toplevels()) - before

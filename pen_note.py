@@ -14,6 +14,7 @@ Needs: python3-gi with GTK4 and python3-gi-cairo, poppler-utils (pdftoppm, pdfto
 python3-pypdf, python3-cairo, and for digital signatures: pyhanko (pip install --user pyhanko).
 """
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import html
@@ -233,7 +234,9 @@ EXPORT_MAX_PIXELS = 60_000_000   # total pixels of the saved PNG
 EXPORT_SCALE = 3.0          # saved PNG pixels per world pixel, reduced if that exceeds the limits
 
 # --- slides (PowerPoint, OpenDocument, PDF) ----------------------------------
-SLIDE_EXTS = {".pptx", ".ppt", ".pps", ".ppsx", ".odp", ".pdf"}
+# Everything opened this way becomes PDF pages: slides, Word, Excel and OpenDocument files via LibreOffice
+OFFICE_EXTS = {".pptx", ".ppt", ".pps", ".ppsx", ".odp", ".docx", ".doc", ".odt", ".rtf", ".xlsx", ".xls", ".ods"}
+SLIDE_EXTS = OFFICE_EXTS | {".pdf"}
 SLIDE_RENDER_WIDTH = 1400   # pixels per slide picture
 SLIDE_DISPLAY_WIDTH = 900   # world pixels per slide on the surface
 SLIDE_GAP_RATIO = 0.6       # blank space after each slide, as a fraction of the slide's height
@@ -593,7 +596,7 @@ def convert_slides(path, progress=lambda text: None, on_page=None, password=None
     path = Path(path)
     ext = path.suffix.lower()
     if ext not in SLIDE_EXTS:
-        raise RuntimeError("that isn't a PowerPoint, OpenDocument or PDF file")
+        raise RuntimeError("that isn't a PDF, Word, PowerPoint, Excel or OpenDocument file")
     key = file_sha1(path)
     pdf_store = PDF_STORE / f"{key}.pdf"
     locked = None
@@ -636,7 +639,9 @@ def convert_slides(path, progress=lambda text: None, on_page=None, password=None
                 else:
                     office = shutil.which("libreoffice") or shutil.which("soffice")
                     if not office:
-                        raise RuntimeError("LibreOffice isn't installed; export the slides as a PDF and add that instead")
+                        raise RuntimeError("Word, PowerPoint, Excel and OpenDocument files need LibreOffice, which isn't "
+                                           "installed. Install it with: sudo snap install libreoffice, or save the file "
+                                           "as a PDF and open that")
                     progress("Converting with LibreOffice… a big deck can take a minute (a PDF is much faster)")
                     profile = WORK_DIR / "lo-profile"   # own profile: works even while LibreOffice is open
                     r = subprocess.run(
@@ -676,6 +681,56 @@ def convert_slides(path, progress=lambda text: None, on_page=None, password=None
             if on_page:
                 on_page(i, total, ratio, str(pdf_store))
         return total
+
+
+# What belongs to one open document (tab). The app holds the current tab's state as plain attributes and
+# swaps it with the stored one when you jump to another tab.
+DOC_STATE = ("strokes", "items", "_sel_items", "_sel_strokes", "undo_stack", "redo_stack", "zoom", "ox", "oy",
+             "saved_base", "dirty", "close_warned", "pending", "deck_state")
+
+
+class Doc:
+    def __init__(self, source=None):
+        self.source = source           # the file this tab was opened from
+        self.name_text = ""            # what is typed in the note name box
+        self.strokes, self.items = [], []
+        self._sel_items, self._sel_strokes = [], []
+        self.undo_stack, self.redo_stack = [], []
+        self.zoom, self.ox, self.oy = 1.0, 0.0, 0.0
+        self.saved_base, self.dirty, self.close_warned = None, False, False
+        self.pending, self.deck_state = {}, {}
+
+
+EXPORT_FORMATS = (("pdf", "PDF"), ("docx", "Word (.docx)"), ("pptx", "PowerPoint (.pptx)"),
+                  ("odt", "OpenDocument text (.odt)"), ("odp", "OpenDocument slides (.odp)"),
+                  ("txt", "Plain text (.txt)"), ("png", "Pictures (.png, one per page)"))
+OFFICE_FILTERS = {"docx": ("writer_pdf_import", "docx:MS Word 2007 XML"), "pptx": ("impress_pdf_import", "pptx"),
+                  "odt": ("writer_pdf_import", "odt"), "odp": ("impress_pdf_import", "odp")}
+
+
+def convert_pdf_to_office(pdf, out, fmt):
+    """Turn a PDF into a Word, PowerPoint or OpenDocument file with LibreOffice (slow: call off the UI thread).
+    The layout and text are kept; Word may split long text into boxes. Raises RuntimeError."""
+    office = shutil.which("libreoffice") or shutil.which("soffice")
+    if not office:
+        raise RuntimeError("Word, PowerPoint and OpenDocument export needs LibreOffice, which isn't installed. "
+                           "Install it with: sudo snap install libreoffice   (PDF, text and pictures work without it)")
+    infilter, target = OFFICE_FILTERS[fmt]
+    WORK_DIR.mkdir(exist_ok=True)
+    job = Path(tempfile.mkdtemp(prefix="export-", dir=WORK_DIR))
+    try:
+        shutil.copyfile(pdf, job / "export.pdf")
+        r = subprocess.run([office, f"-env:UserInstallation={(WORK_DIR / 'lo-profile').as_uri()}", "--headless",
+                            f"--infilter={infilter}", "--convert-to", target, "--outdir", str(job), str(job / "export.pdf")],
+                           capture_output=True, text=True, timeout=300)
+        made = job / f"export.{fmt}"
+        if not made.exists():
+            raise RuntimeError("LibreOffice could not convert it" + (f": {(r.stdout + r.stderr).strip()[-120:]}" if r.stderr.strip() else ""))
+        shutil.move(str(made), str(out))
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("the conversion took too long (over 5 minutes)") from None
+    finally:
+        shutil.rmtree(job, ignore_errors=True)
 
 
 class Item:
@@ -799,6 +854,9 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.line_cache = {}      # (pdf, page) -> its text lines
             self.pdf_passwords = {}   # a PDF in use -> the password it was opened with (saved copies get it back)
             self.deck_password = {}   # file being opened -> password given for it
+            self.cur = Doc()          # the tab you are looking at (its state lives in the attributes below)
+            self.docs = [self.cur]    # all tabs, in the order of the list on the left
+            self.tab_buttons = {}     # tab -> its button in the list
             self.tex_cache = OrderedDict()   # (pdf, page) -> picture of that page, newest last
             self.tex_pending = set()         # pages being drawn right now
             self.tex_failed = set()
@@ -875,12 +933,22 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.win = win
             win.set_default_size(1440, 800)
 
-            outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-            win.set_child(outer)
-            outer.append(self.build_sidebar())
-            outer.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+            ui = self.load_ui()
+            self.nav_width = min(max(int(ui.get("nav_width", 190)), 120), 600)
+            nav_open = bool(ui.get("nav_open", True))
+            self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)   # drag the bar to resize
+            self.sidebar = self.build_sidebar()
+            self.paned.set_start_child(self.sidebar)
+            self.paned.set_resize_start_child(False)
+            self.paned.set_shrink_start_child(False)
             root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
-            outer.append(root)
+            self.paned.set_end_child(root)
+            self.paned.set_resize_end_child(True)
+            self.paned.set_shrink_end_child(False)
+            self.paned.set_position(self.nav_width)
+            self.sidebar.set_visible(nav_open)
+            self.paned.connect("notify::position", self.on_nav_moved)
+            win.set_child(self.paned)
 
             def new_bar():
                 # in a scroller, so a long row of tools never makes the window wider than the screen
@@ -900,6 +968,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
             # row 1: name, open, view, history, save
             bar = new_bar()
+            self.nav_btn = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", active=nav_open)
+            self.nav_btn.set_tooltip_text("Show or hide the side panel (Ctrl+B). Drag its edge to make it wider or narrower")
+            self.nav_btn.connect("toggled", self.on_nav_toggled)
+            bar.append(self.nav_btn)
             self.name_entry = Gtk.Entry(placeholder_text="Note name (optional)", hexpand=True)
             bar.append(self.name_entry)
             add_button(bar, "−", lambda *_: self.zoom_by(1 / 1.4), "Zoom out")
@@ -908,8 +980,20 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             add_button(bar, "Undo", self.on_undo, "Undo (Ctrl+Z)")
             add_button(bar, "Redo", self.on_redo, "Redo (Ctrl+Shift+Z)")
             add_button(bar, "Clear", self.on_clear, "Remove everything")
-            add_button(bar, "Save PDF", self.on_save_pdf,
-                       "Save as a PDF: opened PDF pages stay sharp, your marks go on top")
+            menu = Gtk.MenuButton(label="Export")
+            menu.set_tooltip_text("Save as a PDF, Word, PowerPoint or another format")
+            popover = Gtk.Popover()
+            plist = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_top=6, margin_bottom=6,
+                            margin_start=6, margin_end=6)
+            for fmt, label in EXPORT_FORMATS:
+                item = Gtk.Button(label=label)
+                item.add_css_class("flat")
+                item.get_child().set_halign(Gtk.Align.START)
+                item.connect("clicked", lambda _b, f=fmt: (popover.popdown(), self.export_as(f)))
+                plist.append(item)
+            popover.set_child(plist)
+            menu.set_popover(popover)
+            bar.append(menu)
             save = add_button(bar, "Save", lambda *_: self.save(notify=True))
             save.add_css_class("suggested-action")
 
@@ -976,6 +1060,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             bar.append(tip)
 
             self.area = Canvas(self)
+            self.area.set_size_request(320, -1)                  # the surface keeps room however wide the panel is
             root.append(self.area)
             self.editor = Gtk.TextView(wrap_mode=Gtk.WrapMode.NONE, visible=False, left_margin=0, right_margin=0,
                                        top_margin=0, bottom_margin=0)
@@ -1075,6 +1160,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             win.present()
             prune_pdf_store()
             self.refresh_recent()
+            self.refresh_tabs()
             self.area.grab_focus()
             if slides:
                 self.add_slide_file(slides)
@@ -1086,6 +1172,144 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             tw, th = tex.get_width(), tex.get_height()
             width = min(720.0, 480.0 * tw / max(th, 1))
             self.items.append(Item("image", 40.0, 40.0, width=width, texture=tex, auto=True))
+
+        # ---- tabs: each opened document has its own ---------------------------------
+        def stash(self):
+            """Copy the live state into the current tab, so it can be left and come back unchanged."""
+            for k in DOC_STATE:
+                setattr(self.cur, k, getattr(self, k))
+            self.cur.name_text = self.name_entry.get_text()
+
+        def load(self, doc):
+            self.cur = doc
+            for k in DOC_STATE:
+                setattr(self, k, getattr(doc, k))
+            self.name_entry.set_text(doc.name_text)
+            self.current = self.grab = self.marquee = None
+
+        @contextlib.contextmanager
+        def in_doc(self, doc):
+            """Work on another tab for a moment (a deck arriving, a note being saved) without switching to it."""
+            if doc is self.cur:
+                yield
+                return
+            self.stash()
+            before = self.cur
+            self.load(doc)
+            try:
+                yield
+            finally:
+                self.stash()
+                self.load(before)
+                self.update_title()
+
+        def peek(self, doc, key):
+            return getattr(self if doc is self.cur else doc, key)
+
+        def doc_title(self, doc):
+            base = self.peek(doc, "saved_base")
+            if base:
+                return base
+            return Path(doc.source).stem if doc.source else "Untitled"
+
+        def update_title(self):
+            title = self.doc_title(self.cur)
+            self.win.set_title("Pen Note" if title == "Untitled" else f"Pen Note: {title}")
+
+        def is_blank(self, doc):
+            return (not doc.source and not self.peek(doc, "saved_base") and not self.peek(doc, "strokes")
+                    and not any(not i.auto for i in self.peek(doc, "items")) and not self.peek(doc, "pending"))
+
+        def new_doc(self, source=None):
+            doc = Doc(source)
+            self.docs.append(doc)
+            return doc
+
+        def tab_for_new(self, source=None):
+            """A tab for something being opened: the empty one you are on, else a fresh one."""
+            if self.is_blank(self.cur):
+                self.cur.source = source
+                self.refresh_tabs()
+                return self.cur
+            doc = self.new_doc(source)
+            self.switch_to(doc)
+            return doc
+
+        def switch_to(self, doc):
+            if doc is not self.cur:
+                self.finish_edit()
+                self.stash()
+                self.load(doc)
+                self.status.set_text("")
+            self.update_title()
+            self.refresh_tabs()
+            self.area.grab_focus()
+            self.area.queue_draw()
+
+        def on_new_tab(self, *_):
+            self.switch_to(self.new_doc())
+
+        def remove_doc(self, doc):
+            """Take a tab away (it has been saved, or never had anything)."""
+            index = self.docs.index(doc)
+            self.docs.remove(doc)
+            if not self.docs:
+                self.docs.append(Doc())
+            if doc is self.cur:
+                self.cur = doc                              # already stashed: just show the neighbour
+                self.load(self.docs[min(index, len(self.docs) - 1)])
+            self.update_title()
+            self.refresh_tabs()
+            self.area.queue_draw()
+
+        def close_tab(self, doc):
+            with self.in_doc(doc):
+                ok = True
+                if self.dirty and (self.has_content() or self.saved_base):
+                    ok = self.save()                           # like closing the window: what you made is kept
+                if not ok and not self.close_warned:
+                    self.close_warned = True
+                    self.status.set_text(self.status.get_text() + "  (Click × again to discard.)")
+                    return
+            self.remove_doc(doc)
+
+        def discard_if_empty(self, doc):
+            """A tab whose file could not be opened goes away again."""
+            if doc in self.docs and len(self.docs) > 1 and self.is_blank_content(doc):
+                self.remove_doc(doc)
+
+        def is_blank_content(self, doc):
+            return not self.peek(doc, "strokes") and not self.peek(doc, "items") and not self.peek(doc, "pending")
+
+        def refresh_tabs(self):
+            box = getattr(self, "tabs_box", None)
+            if box is None:
+                return
+            self.stash()
+            while (child := box.get_first_child()) is not None:
+                box.remove(child)
+            self.tab_buttons = {}
+            for doc in self.docs:
+                row = Gtk.Box(spacing=2)
+                if doc is self.cur:
+                    row.add_css_class("pennote-tab-active")
+                title = self.doc_title(doc)
+                b = Gtk.Button(label=("• " if doc.dirty else "") + title, hexpand=True)
+                b.add_css_class("flat")
+                lab = b.get_child()
+                lab.set_halign(Gtk.Align.START)
+                lab.set_ellipsize(Pango.EllipsizeMode.END)
+                lab.set_max_width_chars(17)
+                b.set_tooltip_text(Path(doc.source).name if doc.source else title)
+                b.connect("clicked", lambda _b, d=doc: self.switch_to(d))
+                x = Gtk.Button(label="×")
+                x.add_css_class("flat")
+                x.set_tooltip_text("Close this tab (what you made is saved as a note)")
+                x.connect("clicked", lambda _b, d=doc: self.close_tab(d))
+                row.append(b)
+                row.append(x)
+                box.append(row)
+                self.tab_buttons[doc] = b
 
         # ---- selection ---------------------------------------------------------
         @property
@@ -1274,6 +1498,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.undo_stack.append(self.state())
             del self.undo_stack[:-50]
             self.redo_stack.clear()  # a new action ends the redo history
+            if not self.dirty:
+                b = self.tab_buttons.get(self.cur)
+                if b is not None:
+                    b.set_label("• " + self.doc_title(self.cur))
             self.dirty = True
 
         def on_undo(self, *_):
@@ -1316,6 +1544,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.on_redo() if shift else self.on_undo()
             elif ctrl_down and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
                 self.on_redo()
+            elif ctrl_down and keyval in (Gdk.KEY_b, Gdk.KEY_B):
+                self.nav_btn.set_active(not self.nav_btn.get_active())
             elif ctrl_down and keyval in (Gdk.KEY_a, Gdk.KEY_A):
                 self.select_all()
             elif keyval == Gdk.KEY_Escape and (self._sel_items or self._sel_strokes):
@@ -1426,10 +1656,43 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         # ---- slides ----------------------------------------------------------
         # ---- left panel: what to open, page tools, recent notes ------------------
+        def ui_file(self):
+            if os.environ.get("PEN_NOTE_SELFTEST") and not os.environ.get("PEN_NOTE_CONFIG"):
+                return None                                 # a self-test never touches your real settings
+            return config_dir() / "window.json"
+
+        def load_ui(self):
+            f = self.ui_file()
+            try:
+                return json.loads(f.read_text()) if f else {}
+            except (OSError, ValueError):
+                return {}
+
+        def save_ui(self):
+            if self.ui_file() is None:
+                return
+            try:
+                config_dir().mkdir(parents=True, exist_ok=True)
+                self.ui_file().write_text(json.dumps(
+                    {"nav_width": int(self.nav_width), "nav_open": self.sidebar.get_visible()}))
+            except OSError:
+                pass
+
+        def on_nav_moved(self, paned, _pspec):
+            if self.sidebar.get_visible() and paned.get_position() >= 100:
+                self.nav_width = paned.get_position()
+
+        def on_nav_toggled(self, btn):
+            show = btn.get_active()
+            self.sidebar.set_visible(show)
+            if show:
+                self.paned.set_position(self.nav_width)
+            self.save_ui()
+
         def build_sidebar(self):
             side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
                            margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
-            side.set_size_request(168, -1)
+            side.set_size_request(110, -1)
 
             def head(text):
                 lab = Gtk.Label(label=text, xalign=0, margin_top=10, margin_bottom=2)
@@ -1441,21 +1704,34 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 b = Gtk.Button(label=label)
                 b.add_css_class("flat")
                 b.get_child().set_halign(Gtk.Align.START)
+                b.get_child().set_ellipsize(Pango.EllipsizeMode.END)     # a narrow panel cuts the words, not the layout
                 b.connect("clicked", cb)
                 if tip:
                     b.set_tooltip_text(tip)
                 side.append(b)
 
-            head("OPEN")
+            head("TABS")
+            self.tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            side.append(self.tabs_box)
+            button("+ New note", self.on_new_tab, "A blank note in its own tab")
+            self.tab_css = Gtk.CssProvider()
+            self.tab_css.load_from_string(".pennote-tab-active { background: alpha(currentColor, 0.15); border-radius: 6px; }")
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.tab_css,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            head("OPEN (each in its own tab)")
             button("Note…", self.on_open, "A note you saved before, to continue it")
             button("PDF…", lambda *_: self.pick_file("Open a PDF", "PDF", [".pdf"], self.add_slide_file),
-                   "Open a PDF: write on it, highlight, then Save PDF. Open a second one to join them")
+                   "Open a PDF: write on it, highlight, then Export")
+            button("Word, slides, Excel…", lambda *_: self.pick_file(
+                "Open a Word, PowerPoint, Excel or OpenDocument file", "Office files", sorted(OFFICE_EXTS),
+                self.add_slide_file), "It opens as pages you can write on: every page or slide becomes a PDF page")
             button("Picture…", lambda *_: self.pick_file(
-                "Add a picture", "Pictures", [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"], self.add_picture_file))
-            button("Slides…", lambda *_: self.pick_file(
-                "Add slides", "PowerPoint, OpenDocument", sorted(SLIDE_EXTS - {".pdf"}), self.add_slide_file),
-                "A PowerPoint or OpenDocument presentation: every slide becomes a PDF page")
+                "Add a picture", "Pictures", [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"], self.add_picture_file),
+                "Adds a picture to the tab you are in")
             head("PDF PAGES")
+            button("Join another PDF…", lambda *_: self.pick_file(
+                "Add a PDF to this one", "PDF", [".pdf"], lambda p: self.add_slide_file(p, new_tab=False)),
+                "Puts another PDF next to this one in the same tab, so Export saves them as one file")
             button("Rotate page", self.rotate_page, "Turn the selected page (or the one in the middle of the view)")
             button("Delete page", self.delete_page)
             button("Move page up", lambda *_: self.move_page(-1))
@@ -1477,6 +1753,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.recent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             side.append(self.recent_box)
             sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            sc.set_min_content_width(110)
             sc.set_child(side)
             return sc
 
@@ -1528,9 +1805,22 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.status.set_text(text)
             return False
 
-        def add_slide_file(self, path, done=None, password=None):
-            """Convert a deck in the background; its slides appear one by one as they are ready."""
+        def add_slide_file(self, path, done=None, password=None, doc=None, new_tab=True):
+            """Open a PDF, Word, slides or Excel file in its own tab (new_tab=False: into the tab you are on).
+            Pages appear one by one as they are ready."""
             name = Path(path).name
+            if doc is None:
+                if new_tab:
+                    existing = next((d for d in self.docs if d.source == path), None)
+                    if existing is not None:                   # already open: jump to it
+                        self.switch_to(existing)
+                        self.status.set_text(f"“{name}” is already open in this tab.")
+                        if done:
+                            done()
+                        return
+                    doc = self.tab_for_new(path)
+                else:
+                    doc = self.cur
             if path in self.importing:
                 self.status.set_text(f"“{name}” is already being opened. Please wait.")
                 if done:
@@ -1548,19 +1838,19 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     n = convert_slides(
                         path,
                         lambda t: GLib.idle_add(self.show_progress, label + t),
-                        lambda i, total, ratio, pdf: GLib.idle_add(self.slide_ready, path, name, i, total, ratio, pdf),
+                        lambda i, total, ratio, pdf: GLib.idle_add(self.slide_ready, doc, path, name, i, total, ratio, pdf),
                         password)
                     err = None
                 except PasswordNeeded as e:
-                    GLib.idle_add(self.slides_done, path, name, 0, None, None)
-                    GLib.idle_add(self.ask_password, path, name, done, e.wrong)
+                    GLib.idle_add(self.slides_done, doc, path, name, 0, None, None)
+                    GLib.idle_add(self.ask_password, doc, path, name, done, e.wrong)
                     return
                 except Exception as e:  # noqa: BLE001
                     n, err = 0, str(e)
-                GLib.idle_add(self.slides_done, path, name, n, err, done)
+                GLib.idle_add(self.slides_done, doc, path, name, n, err, done)
             threading.Thread(target=work, daemon=True).start()
 
-        def ask_password(self, path, name, done, wrong):
+        def ask_password(self, doc, path, name, done, wrong):
             dlg = Gtk.Window(title="Password needed", transient_for=self.win, modal=True, default_width=360)
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
                           margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
@@ -1580,63 +1870,74 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             def go(*_):
                 pw = entry.get_text()
                 dlg.close()
-                self.add_slide_file(path, done, password=pw)
+                self.add_slide_file(path, done, password=pw, doc=doc)
+
+            def stop(*_):
+                dlg.close()
+                self.discard_if_empty(doc)
+                if done:
+                    done()
             ok.connect("clicked", go)
             entry.connect("activate", go)
-            cancel.connect("clicked", lambda *_: (dlg.close(), done() if done else None))
+            cancel.connect("clicked", stop)
             dlg.present()
             entry.grab_focus()
             return False
 
-        def slide_ready(self, path, name, i, total, ratio, pdf):
-            """One more slide arrived: show it straight away, below the previous one.
+        def slide_ready(self, doc, path, name, i, total, ratio, pdf):
+            """One more page arrived: show it straight away, below the previous one.
 
-            Slides stay 'pending' (visible, but not yet part of the note) until the whole deck is
+            Pages stay 'pending' (visible, but not yet part of the note) until the whole file is
             there; only then do they become one undo step. That keeps Undo consistent even if you
-            draw while the rest of the deck is still loading."""
+            draw while the rest of the file is still loading."""
             try:
-                st = self.deck_state.get(path)
-                if st is None:                                   # first slide: decide where the deck goes
-                    w, h = self.canvas_size()
-                    if self.strokes or self.items:               # keep clear of what's there: start to its right
-                        bx, by, bw, bh = self.content_bounds()
-                        x0, y0 = bx + bw - EXPORT_MARGIN + 200, by + EXPORT_MARGIN
-                    else:
-                        x0, y0 = self.to_world(40, 40)
-                    st = self.deck_state[path] = {"x": x0, "y": y0}
-                    self.pending[path] = []
-                    z = min(1.0, (w - 80) / SLIDE_DISPLAY_WIDTH)
-                    self.set_view(z, 40 - x0 * z, 40 - y0 * z)   # first slide at the top-left of the view
-                if self.deck_password.get(path):               # keep the password: Save PDF locks the result again
-                    self.pdf_passwords[pdf] = self.deck_password[path]
-                height = SLIDE_DISPLAY_WIDTH * ratio
-                self.pending[path].append(Item("image", st["x"], st["y"], width=SLIDE_DISPLAY_WIDTH,
-                                               ratio=ratio, pdf=(pdf, i - 1)))
-                st["y"] += height * (1 + SLIDE_GAP_RATIO)
-                self.show_progress(f"“{name}”: slide {i} of {total} ready" + ("" if i < total else "."))
-                self.area.queue_draw()
+                with self.in_doc(doc):
+                    st = self.deck_state.get(path)
+                    if st is None:                                   # first page: decide where the file goes
+                        w, h = self.canvas_size()
+                        if self.strokes or self.items:               # keep clear of what's there: start to its right
+                            bx, by, bw, bh = self.content_bounds()
+                            x0, y0 = bx + bw - EXPORT_MARGIN + 200, by + EXPORT_MARGIN
+                        else:
+                            x0, y0 = self.to_world(40, 40)
+                        st = self.deck_state[path] = {"x": x0, "y": y0}
+                        self.pending[path] = []
+                        z = min(1.0, (w - 80) / SLIDE_DISPLAY_WIDTH)
+                        self.set_view(z, 40 - x0 * z, 40 - y0 * z)   # first page at the top-left of the view
+                    if self.deck_password.get(path):               # keep the password: Export locks the result again
+                        self.pdf_passwords[pdf] = self.deck_password[path]
+                    height = SLIDE_DISPLAY_WIDTH * ratio
+                    self.pending[path].append(Item("image", st["x"], st["y"], width=SLIDE_DISPLAY_WIDTH,
+                                                   ratio=ratio, pdf=(pdf, i - 1)))
+                    st["y"] += height * (1 + SLIDE_GAP_RATIO)
+                    self.show_progress(f"“{name}”: page {i} of {total} ready" + ("" if i < total else "."))
+                    self.area.queue_draw()
             except Exception as e:  # noqa: BLE001
-                log("slide display failed:", e)
+                log("page display failed:", e)
             return False
 
-        def slides_done(self, path, name, n, err, done):
+        def slides_done(self, doc, path, name, n, err, done):
             self.importing.discard(path)
             self.deck_password.pop(path, None)
-            self.deck_state.pop(path, None)
-            slides = self.pending.pop(path, [])
             if not self.importing:
                 self.spinner.stop()
                 self.spinner.set_visible(False)
+            with self.in_doc(doc):
+                self.deck_state.pop(path, None)
+                slides = self.pending.pop(path, [])
+                if err:
+                    log("slides failed:", name, err)
+                    self.status.set_text(f"Could not open “{name}”: {err}")
+                elif slides:
+                    self.push_undo()                                  # the whole file is one undo step
+                    self.items.extend(slides)
+                    self.selected = None
+                    self.area.queue_draw()
+                    self.status.set_text(f"Opened “{name}”: {len(slides)} page{'s' if len(slides) != 1 else ''}. "
+                                         "Scroll down to see them all and write on them.")
             if err:
-                log("slides failed:", name, err)
-                self.status.set_text(f"Could not open “{name}”: {err}")
-            elif slides:
-                self.push_undo()                                  # the whole deck is one undo step
-                self.items.extend(slides)
-                self.selected = None
-                self.area.queue_draw()
-                self.status.set_text(f"Added {len(slides)} slide{'s' if len(slides) != 1 else ''} from “{name}”. "
-                                     "Move down to see them all and write in the space between them.")
+                self.discard_if_empty(doc)
+            self.refresh_tabs()
             if done:
                 done()
             return False
@@ -2515,6 +2816,84 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         def on_save_pdf(self, *_):
             self.ask_pdf_path(None)
 
+        def export_as(self, fmt):
+            """Save what is on the surface as PDF, Word, PowerPoint, OpenDocument, text or pictures."""
+            if fmt == "pdf":
+                self.ask_pdf_path(None)
+                return
+            if not (self.strokes or self.items):
+                self.status.set_text("Nothing to export yet.")
+                return
+            label = dict(EXPORT_FORMATS)[fmt]
+            name = safe_name(self.name_entry.get_text()) or self.saved_base or "Pen note"
+            dlg = Gtk.FileDialog(title=f"Export as {label}")
+            if NOTES_DIR.is_dir():
+                dlg.set_initial_folder(Gio.File.new_for_path(str(NOTES_DIR)))
+            if fmt == "png":
+                dlg.select_folder(self.win, None, lambda d, res: self.export_picked(fmt, d, res, name, True))
+            else:
+                dlg.set_initial_name(f"{name}.{fmt}")
+                dlg.save(self.win, None, lambda d, res: self.export_picked(fmt, d, res, name, False))
+
+        def export_picked(self, fmt, dlg, res, name, folder):
+            try:
+                f = dlg.select_folder_finish(res) if folder else dlg.save_finish(res)
+            except GLib.Error:
+                return                                       # cancelled
+            target = Path(f.get_path())
+            if not folder and target.suffix.lower() != f".{fmt}":
+                target = target.with_name(target.name + f".{fmt}")
+            self.run_export(fmt, target, name)
+
+        def run_export(self, fmt, target, name, done=None):
+            try:
+                PDF_STORE.mkdir(parents=True, exist_ok=True)
+                tmp_pdf = PDF_STORE / f"prot-export-{os.getpid()}-{time.time_ns()}.pdf"   # cleared at next start
+                self.export_pdf(tmp_pdf, protect=False)       # the pages with all your marks, as PDF
+            except Exception as e:  # noqa: BLE001
+                log("export failed:", e)
+                self.status.set_text(f"Export failed: {e}")
+                return
+            note = " (it has no password: the original's is not carried over)" if self.pdf_passwords else ""
+
+            def finished(err, msg):
+                tmp_pdf.unlink(missing_ok=True)
+                self.importing.discard("export")
+                if not self.importing:
+                    self.spinner.stop()
+                    self.spinner.set_visible(False)
+                self.status.set_text(f"Export failed: {err}" if err else msg + note)
+                if done:
+                    done(err, msg)
+                return False
+
+            def work():
+                try:
+                    if fmt in OFFICE_FILTERS:
+                        convert_pdf_to_office(tmp_pdf, target, fmt)
+                        what = {"docx": "Word file. It keeps the look; long text may be split into boxes",
+                                "pptx": "PowerPoint. Each page is a slide",
+                                "odt": "OpenDocument text", "odp": "OpenDocument slides. Each page is a slide"}[fmt]
+                        msg = f"Saved {what}: {target}"
+                    elif fmt == "txt":
+                        text = subprocess.run(["pdftotext", "-layout", str(tmp_pdf), "-"], capture_output=True,
+                                              text=True, timeout=120).stdout
+                        target.write_text(text)
+                        msg = f"Saved the text: {target}"
+                    else:
+                        subprocess.run(["pdftoppm", "-png", "-r", "150", str(tmp_pdf), str(target / name)],
+                                       capture_output=True, timeout=600, check=True)
+                        count = len(list(target.glob(f"{name}-*.png")))
+                        msg = f"Saved {count} picture{'s' if count != 1 else ''} in {target}"
+                    GLib.idle_add(finished, None, msg)
+                except Exception as e:  # noqa: BLE001
+                    GLib.idle_add(finished, str(e), "")
+            self.importing.add("export")
+            self.spinner.set_visible(True)
+            self.spinner.start()
+            self.status.set_text(f"Exporting as {dict(EXPORT_FORMATS)[fmt]}… a few seconds")
+            threading.Thread(target=work, daemon=True).start()
+
         def on_create_certificate(self, made):
             """A small form that makes a personal signing certificate; made(path) is called with its file."""
             dlg = Gtk.Window(title="Create my certificate", transient_for=self.win, modal=True, default_width=380)
@@ -2976,9 +3355,15 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             dlg.present()
 
         def open_note(self, base):
-            """Replace the surface with a saved note so it can be continued."""
+            """Open a saved note in a tab so it can be continued (jumps to it if it is already open)."""
+            existing = next((d for d in self.docs if self.peek(d, "saved_base") == base), None)
+            if existing is not None and existing is not self.cur:
+                self.switch_to(existing)
+                return True
+            if existing is None:
+                self.tab_for_new(None)                       # the empty tab you are on, or a new one
             if self.dirty and (self.has_content() or self.saved_base):
-                self.save()                                  # don't lose what's on screen
+                self.save()                                  # reopening this very note: keep what is on screen
             proj = PROJECT_DIR / f"{base}.pennote"
             png = NOTES_DIR / f"{base}.png"
             try:
@@ -3010,8 +3395,9 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.close_warned = False
             self.set_mode("pen")
             self.set_view(*view)
-            self.win.set_title(f"Pen Note: {base}" if base else "Pen Note")
+            self.update_title()
             self.refresh_recent()
+            self.refresh_tabs()
 
         def open_project_file(self, p):
             """Open a .pennote file. One from the vault continues that note; any other is a copy
@@ -3020,8 +3406,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             if p.parent == PROJECT_DIR.resolve() and (NOTES_DIR / f"{p.stem}.png").exists():
                 self.open_note(p.stem)
                 return
-            if self.dirty and (self.has_content() or self.saved_base):
-                self.save()                                  # don't lose what's on screen
+            self.tab_for_new(None)                           # the empty tab you are on, or a new one
             try:
                 strokes, items, view = self.read_project(p)
             except Exception as e:  # noqa: BLE001
@@ -3084,9 +3469,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         f.unlink(missing_ok=True)
                 self.saved_base = base
                 self.dirty = False
-                self.win.set_title(f"Pen Note: {base}")
+                self.update_title()
                 self.status.set_text(f"Saved: Pen Notes/{base}")
                 self.refresh_recent()
+                self.refresh_tabs()
                 return True
             except Exception as e:  # noqa: BLE001
                 log("save failed:", e)
@@ -3094,13 +3480,23 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return False
 
         def on_close(self, win):
-            if self.dirty and (self.has_content() or self.saved_base):
-                if not self.save() and not self.close_warned:
-                    # Warn once, then let the next close go through: a failing save must never
-                    # leave the window impossible to close.
-                    self.close_warned = True
-                    self.status.set_text(self.status.get_text() + "  (Close again to discard.)")
-                    return True
+            self.finish_edit()
+            for doc in list(self.docs):
+                with self.in_doc(doc):
+                    if self.dirty and (self.has_content() or self.saved_base):
+                        if not self.save() and not self.close_warned:
+                            # Warn once, then let the next close go through: a failing save must never
+                            # leave the window impossible to close.
+                            self.close_warned = True
+                            self.status.set_text(self.status.get_text() + "  (Close again to discard.)")
+                            blocked = doc
+                            break
+            else:
+                blocked = None
+            if blocked is not None:
+                self.switch_to(blocked)
+                return True
+            self.save_ui()
             self.render_pool.shutdown(wait=False, cancel_futures=True)
             if screenshot:
                 Path(screenshot).unlink(missing_ok=True)
