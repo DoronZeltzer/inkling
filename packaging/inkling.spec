@@ -5,7 +5,8 @@ import shutil
 import sys
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))        # SPECPATH: the folder of this file (set by PyInstaller)
-ICON = os.path.join(ROOT, "packaging", "windows", "inkling.ico" if sys.platform == "win32" else "macos/inkling.icns")
+ICON = os.path.join(ROOT, "packaging", "windows", "inkling.ico") if sys.platform == "win32" else os.path.join(
+    ROOT, "packaging", "macos", "inkling.icns")
 
 # helper programs the app starts: they travel inside the package, in a "bin" folder
 binaries = []
