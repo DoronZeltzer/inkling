@@ -1,0 +1,137 @@
+name: Build downloads
+
+# Every push builds the Windows and Mac downloads (see the run's "Artifacts"). Pushing a tag such as v0.1.0
+# also posts them on the repository's Releases page.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-python-gobject
+            mingw-w64-ucrt-x86_64-python-cairo
+            mingw-w64-ucrt-x86_64-python-pillow
+            mingw-w64-ucrt-x86_64-python-cryptography
+            mingw-w64-ucrt-x86_64-python-yaml
+            mingw-w64-ucrt-x86_64-python-lxml
+            mingw-w64-ucrt-x86_64-python-pyinstaller
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-poppler
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+
+      - name: Python helpers that are not packaged for MSYS2
+        run: pip install --break-system-packages pypdf
+
+      - name: Does it run from the source?
+        run: python inkling.py check
+
+      - name: Build the Windows package
+        run: bash packaging/windows/build.sh
+
+      - name: Does the package start? (a check, then a real window that draws, saves and closes)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$PWD\ci-notes" | Out-Null
+          $p = Start-Process -FilePath "dist\Inkling\Inkling.exe" -ArgumentList "check","--out","$PWD\check.txt" -Wait -PassThru
+          Get-Content check.txt
+          if ($p.ExitCode -ne 0) { throw "the packaged app says something is missing" }
+          $env:INKLING_SELFTEST = "close"
+          $env:INKLING_DIR = "$PWD\ci-notes"
+          $env:INKLING_CONFIG = "$PWD\ci-config"
+          $env:INKLING_LOG = "$PWD\gui.txt"
+          $g = Start-Process -FilePath "dist\Inkling\Inkling.exe" -ArgumentList "canvas" -PassThru
+          if (-not $g.WaitForExit(180000)) { $g.Kill(); throw "the window did not finish in 3 minutes" }
+          if (Test-Path gui.txt) { Get-Content gui.txt }
+          if (-not (Select-String -Path gui.txt -Pattern "window closed: True" -Quiet)) { throw "the window check did not pass" }
+          if (-not (Get-ChildItem ci-notes -Filter *.png)) { throw "the note was not saved" }
+
+      - name: Installer and zip
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $v = $env:GITHUB_REF_NAME.TrimStart("v") } else { $v = "0.0.$env:GITHUB_RUN_NUMBER" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DVersion=$v" packaging\windows\installer.iss
+          Compress-Archive -Path dist\Inkling -DestinationPath dist\Inkling-windows.zip
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/Inkling-Setup.exe
+            dist/Inkling-windows.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GTK and the other programs Inkling needs
+        run: brew install gtk4 pygobject3 py3cairo poppler librsvg adwaita-icon-theme
+
+      - name: Python environment that can see them
+        run: |
+          pyformula="$(brew deps --1 pygobject3 | grep '^python@' | head -1)"
+          PY="$(brew --prefix "$pyformula")/bin/python3"
+          "$PY" -m venv --system-site-packages .venv
+          .venv/bin/pip install pyinstaller pypdf pillow pyyaml lxml cryptography
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Does it run from the source?
+        run: python inkling.py check
+
+      - name: Build the Mac app
+        run: bash packaging/macos/build.sh
+
+      - name: Does the app start? (a check, then a real window that draws, saves and closes)
+        run: |
+          app=dist/Inkling.app/Contents/MacOS/Inkling
+          "$app" check --out check.txt; cat check.txt
+          mkdir -p ci-notes
+          export INKLING_SELFTEST=close INKLING_DIR="$PWD/ci-notes" INKLING_CONFIG="$PWD/ci-config" INKLING_LOG="$PWD/gui.txt"
+          "$app" canvas &
+          pid=$!
+          for i in $(seq 1 90); do kill -0 "$pid" 2>/dev/null || break; sleep 2; done
+          kill "$pid" 2>/dev/null || true
+          cat gui.txt || true
+          grep -q "window closed: True" gui.txt
+          ls ci-notes/*.png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/Inkling-macos.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloads
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: downloads/*
+          generate_release_notes: true

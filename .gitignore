@@ -1,2 +1,7 @@
 __pycache__/
 work/
+build/
+dist/
+packaging/windows/inkling.png
+packaging/windows/inkling.ico
+packaging/macos/inkling.icns

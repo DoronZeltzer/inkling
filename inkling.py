@@ -15,7 +15,6 @@ python3-pypdf, python3-cairo, and for digital signatures: pyhanko (pip install -
 """
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import html
 import io
@@ -40,15 +39,58 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
+try:
+    import fcntl                       # Linux and macOS only: used by the pen watcher
+except ImportError:
+    fcntl = None
+
 SELF = Path(__file__).resolve()
+IS_WINDOWS, IS_MAC = sys.platform == "win32", sys.platform == "darwin"
+FROZEN = bool(getattr(sys, "frozen", False))        # running from a downloaded package, not from the source folder
+
+if IS_WINDOWS:                         # helper programs must not flash a console window
+    _popen_init = subprocess.Popen.__init__
+
+    def _popen_init_hidden(self, *args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | 0x08000000      # CREATE_NO_WINDOW
+        _popen_init(self, *args, **kwargs)
+    subprocess.Popen.__init__ = _popen_init_hidden
+
+if IS_WINDOWS:                         # helper programs that sit beside python.exe (poppler in a Windows build)
+    os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
+if FROZEN:                             # a package carries its helper programs (poppler…) in a bin folder beside it
+    _here = Path(sys.executable).parent
+    _bins = [str(p) for p in (_here / "bin", _here / "_internal" / "bin", _here.parent / "Resources" / "bin") if p.is_dir()]
+    if _bins:
+        os.environ["PATH"] = os.pathsep.join(_bins + [os.environ.get("PATH", "")])
 
 
 def config_dir():
-    return Path(os.environ.get("INKLING_CONFIG") or Path.home() / ".config" / "inkling")
+    """Where settings are kept, by each system's own custom."""
+    if os.environ.get("INKLING_CONFIG"):
+        return Path(os.environ["INKLING_CONFIG"])
+    if IS_WINDOWS:
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Inkling"
+    if IS_MAC:
+        return Path.home() / "Library" / "Application Support" / "Inkling"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "inkling"
+
+
+def cache_dir():
+    """Where things that can be made again are kept (converted files, helper programs)."""
+    if os.environ.get("INKLING_CACHE"):
+        return Path(os.environ["INKLING_CACHE"])
+    if IS_WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "Inkling" / "Cache"
+    if IS_MAC:
+        return Path.home() / "Library" / "Caches" / "Inkling"
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "inkling"
 
 
 def user_dir(name, fallback):
     """A folder of the user's desktop setup (DOCUMENTS, DOWNLOAD…), wherever this computer keeps it."""
+    if IS_WINDOWS or IS_MAC:
+        return Path.home() / fallback
     try:
         text = (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "user-dirs.dirs").read_text()
         m = re.search(rf'^XDG_{name}_DIR="?([^"\n]+)"?', text, re.M)
@@ -130,7 +172,14 @@ EVENT_SIZE = struct.calcsize(EVENT_FMT)
 
 
 def log(*a):
-    print(*a, file=sys.stderr, flush=True)
+    if sys.stderr is not None:                       # a downloaded app on Windows has no console
+        print(*a, file=sys.stderr, flush=True)
+    if os.environ.get("INKLING_LOG"):                # ...so a log file can be asked for
+        try:
+            with open(os.environ["INKLING_LOG"], "a", encoding="utf-8") as f:
+                print(*a, file=f)
+        except OSError:
+            pass
 
 
 def find_pen_device():
@@ -218,6 +267,9 @@ def canvas_running():
 
 
 def run_daemon():
+    if not sys.platform.startswith("linux"):
+        log("The pen watcher (double-tap the pen to open Inkling) needs Linux. Open Inkling from its icon instead.")
+        return
     ignore_until = 0.0
 
     while True:
@@ -312,8 +364,7 @@ MAX_SLIDES = 2000
 # The snap-packaged LibreOffice can only read non-hidden folders inside your home folder,
 # so decks are copied into this work folder (and removed again) for conversion.
 # scratch space: next to the program if that can be written to, else in the user's cache
-WORK_DIR = (SELF.parent / "work") if os.access(SELF.parent, os.W_OK) else Path(
-    os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "inkling" / "work"
+WORK_DIR = (SELF.parent / "work") if (not FROZEN and os.access(SELF.parent, os.W_OK)) else cache_dir() / "work"
 EXPORT_MAX_PAGES = 40       # PDF pages drawn into the saved PNG preview (the rest show as grey boxes)
 PAGE_TEXTURES = 24          # PDF pages kept drawn in memory; the others are drawn again when you scroll back
 # The PDF behind every page (an opened PDF, a converted deck, a turned copy). A saved note carries its
@@ -648,7 +699,7 @@ OFFICE_APPS = {
     "deckcraft": ("DeckCraft", {".pptx", ".ppsx", ".deckcraft"}),
     "gridcraft": ("GridCraft", {".xlsx", ".csv", ".tsv"}),
 }
-TOOL_CACHE = Path.home() / ".cache" / "inkling" / "tools"
+TOOL_CACHE = cache_dir() / "tools"
 APP_ICONS = tuple(f"ai.storyteller.{n}" for n in OFFICE_APPS)      # the icons the apps ship under
 
 
@@ -669,8 +720,31 @@ def libreoffice_path():
     return shutil.which("libreoffice") or shutil.which("soffice")
 
 
+def find_installed_tool(name):
+    """The command-line tool of an office app installed the usual way on Windows or macOS, or None."""
+    cli, label = f"{name}-cli", OFFICE_APPS[name][0]
+    home, found = Path.home(), []
+    if IS_WINDOWS:
+        roots = [Path(os.environ.get(k)) for k in ("LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)") if os.environ.get(k)]
+        for root in roots:
+            for base in (root / label, root / name, root / "Programs" / label, root / "Programs" / name):
+                found += [base / f"{cli}.exe", base / "bin" / f"{cli}.exe"]
+    elif IS_MAC:
+        for apps in (Path("/Applications"), home / "Applications"):
+            for sub_ in ("Contents/MacOS", "Contents/Resources", "Contents/Resources/bin"):
+                found.append(apps / f"{label}.app" / sub_ / cli)
+    return next((p for p in found if p.is_file()), None)
+
+
+def where_to_put_apps():
+    return ("put its AppImage in ~/Applications" if sys.platform.startswith("linux")
+            else "install it, or put its folder on your PATH")
+
+
 def find_appimage(name):
-    """An app's AppImage wherever it lives: the usual folders, or the one a desktop entry starts."""
+    """An app's AppImage wherever it lives: the usual folders, or the one a desktop entry starts (Linux only)."""
+    if not sys.platform.startswith("linux"):
+        return None
     home, found = Path.home(), []
     for d in (home / "Applications", home / ".local" / "bin", home / "bin", home / "Downloads", home / "Desktop", Path("/opt")):
         try:
@@ -699,7 +773,8 @@ def find_appimage(name):
 
 def office_available(name):
     cli = f"{name}-cli"
-    return bool(shutil.which(cli)) or (TOOL_CACHE / name / cli).exists() or find_appimage(name) is not None
+    return (bool(shutil.which(cli)) or find_installed_tool(name) is not None
+            or (TOOL_CACHE / name / cli).exists() or find_appimage(name) is not None)
 
 
 def find_office_tool(name):
@@ -709,6 +784,9 @@ def find_office_tool(name):
     on_path = shutil.which(cli)
     if on_path:
         return Path(on_path)
+    installed = find_installed_tool(name)
+    if installed is not None:
+        return installed
     image = find_appimage(name)
     if image is None:
         return None
@@ -775,7 +853,7 @@ def office_to_pdf(path, out_pdf, progress=lambda text: None):
                 return label
             why = f"{label} could not convert it: {(r.stderr or r.stdout).strip()[-160:]}"
         else:
-            why = f"{label} opens {ext} files, but I can't find it (put its AppImage in ~/Applications)"
+            why = f"{label} opens {ext} files, but I can't find it ({where_to_put_apps()})"
     if libreoffice_path():
         progress("Converting with LibreOffice…")
         libreoffice_to_pdf(path, out_pdf)
@@ -989,7 +1067,7 @@ def export_office(fmt, pdf, out):
         if fmt in LO_EXPORT and libreoffice_path():
             convert_pdf_to_office_lo(pdf, out, fmt)
             return "LibreOffice"
-        raise RuntimeError(f"{label} writes this format, but I can't find it (put its AppImage in ~/Applications, "
+        raise RuntimeError(f"{label} writes this format, but I can't find it ({where_to_put_apps()}, "
                            "or install LibreOffice)")
     WORK_DIR.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="export-", dir=WORK_DIR) as tmp:
@@ -3977,16 +4055,53 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
     return app.run([sys.argv[0], *files])
 
 
+def run_check(out=None):
+    """Report what this computer has, without opening a window. Exit 0 when Inkling can run."""
+    ok = True
+    lines = []
+
+    def say(*a):                                     # to the screen, and to a file if asked (a Windows app has no console)
+        lines.append(" ".join(str(x) for x in a))
+        if sys.stdout is not None:
+            print(*a)
+    say(f"Inkling on {sys.platform}, Python {sys.version.split()[0]}{' (packaged)' if FROZEN else ''}")
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk
+        say(f"  GTK {Gtk.get_major_version()}.{Gtk.get_minor_version()}.{Gtk.get_micro_version()}: ok")
+    except Exception as e:  # noqa: BLE001
+        say(f"  GTK 4 for Python: MISSING ({e})")
+        ok = False
+    for what, pkg in missing_dependencies():
+        say(f"  missing: {what} needs {pkg}")
+        ok = False
+    say(f"  notes are kept in {NOTES_DIR}")
+    for name, (label, _exts) in OFFICE_APPS.items():
+        say(f"  {label}: {'found' if office_available(name) else 'not found (optional)'}")
+    say("Everything needed is here." if ok else "Something needed is missing (see above).")
+    if out:
+        Path(out).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="mode", required=True)
     sub.add_parser("daemon")
+    chk = sub.add_parser("check", help="report what this computer has, without opening a window")
+    chk.add_argument("--out", help="also write the report to this file")
     c = sub.add_parser("canvas")
     c.add_argument("--screenshot")
     c.add_argument("--open", dest="open_name")
     c.add_argument("--slides", help="a PowerPoint/OpenDocument/PDF file to lay out on the canvas")
     c.add_argument("files", nargs="*", help="notes (.inkling), pictures or slides to open")
-    args = ap.parse_args()
+    argv = [a for a in sys.argv[1:] if not a.startswith("-psn")]     # macOS adds this when an app is double-clicked
+    if argv and argv[0] not in ("daemon", "check", "canvas", "-h", "--help"):
+        argv = ["canvas"] + argv                                     # just file names ("Open with"): open them
+    args = ap.parse_args(argv or ["canvas"])                         # no arguments (a double click): open a canvas
+    if args.mode == "check":
+        sys.exit(run_check(args.out))
     if args.mode == "daemon":
         run_daemon()
     else:
