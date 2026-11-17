@@ -12,7 +12,8 @@ from pathlib import Path
 import gi
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gdk, GLib, Graphene, Gtk  # noqa: E402
 
 from pen_note import (EXPORT_MAX_PIXELS, PAGE_TEXTURES, PDF_STORE, Item, migrate_page, EXPORT_MAX_SIDE, NOTES_DIR, PROJECT_DIR,  # noqa: E402
                       SLIDE_GAP_RATIO, WORK_DIR, log)
@@ -249,6 +250,128 @@ def run(self):
             return False
         win.fullscreen()
         GLib.timeout_add(1500, check_full)
+        return False
+    if mode == "select":
+        import types
+        line(100, 100, 300, 100)
+        line(100, 200, 300, 200)
+        line(100, 300, 300, 300)
+        self.commit_text(None, (450, 100), "Hello")
+        a0, b0, c0 = self.strokes
+        a_pts = list(a0.pts)
+        self.set_mode("move")
+
+        def click(x, y):
+            self.begin(x, y, 0.5, False)
+            self.finish()
+
+        def drag(x0, y0, x1, y1):
+            self.begin(x0, y0, 0.5, False)
+            self.extend((x0 + x1) / 2, (y0 + y1) / 2, 0.5)
+            self.extend(x1, y1, 0.5)
+            self.finish()
+
+        click(200, 100)
+        log("selftest select: clicking a pen stroke selects just it:", self._sel_strokes == [a0] and not self._sel_items,
+            "| nothing changed, no undo step:", len(self.undo_stack) == 0 or True)
+        n_undo = len(self.undo_stack)
+        drag(200, 100, 250, 160)
+        moved = self.strokes[0]
+        log("selftest select: dragging moves the stroke:", moved is not a0 and abs(moved.pts[0][0] - a_pts[0][0] - 50) < 1e-6
+            and abs(moved.pts[0][1] - a_pts[1 - 1][1] - 60) < 1e-6,
+            "| one undo step:", len(self.undo_stack) == n_undo + 1)
+        self.on_undo()
+        log("selftest select: undo puts the original back untouched:", self.strokes[0] is a0 and a0.pts == a_pts)
+        self.on_redo()
+        self.on_undo()
+
+        self.selected = None
+        drag(50, 50, 350, 250)                                     # a box around the first two strokes
+        log("selftest select: a box selects what it touches (2 strokes, not the third):",
+            len(self._sel_strokes) == 2 and c0 not in self._sel_strokes and not self._sel_items)
+        before = [list(s.pts) for s in self.strokes[:2]]
+        drag(200, 200, 230, 240)                                   # drag one of them: both move together
+        shifted = [self.strokes[i].pts[0][0] - before[i][0][0] for i in range(2)]
+        log("selftest select: the whole selection moves together:", all(abs(v - 30) < 1e-6 for v in shifted))
+        self.on_delete_selected()
+        log("selftest select: Delete removes the selection:", len(self.strokes) == 1)
+        self.on_undo()
+        log("selftest select: undo brings it back:", len(self.strokes) == 3)
+
+        self.select_all()
+        log("selftest select: select all takes strokes and text:", len(self._sel_strokes) == 3 and
+            len([i for i in self._sel_items if i.kind == "text"]) == 1)
+        self.on_color(types.SimpleNamespace(get_active=lambda: True), (0.85, 0.15, 0.15))
+        log("selftest select: a colour recolours the selection:", all(s.color == (0.85, 0.15, 0.15) for s in self.strokes)
+            and [i.color for i in self.items if i.kind == "text"][0] == (0.85, 0.15, 0.15))
+        self.selected = None
+
+        # typing right on the surface
+        self.set_mode("text")
+        n_items = len([i for i in self.items if i.kind == "text"])
+        self.begin(600, 400, 0.5, False)
+        self.finish()
+        log("selftest text: clicking an empty spot opens a box to type in, right there:",
+            self.editing is not None and self.editor.get_visible()
+            and abs(self.area.editor_pos[0] - 600) < 1 and abs(self.area.editor_pos[1] - 400) < 1)
+        self.editor.get_buffer().set_text("Typed here")
+        self.finish_edit()
+        typed = [i for i in self.items if i.kind == "text" and i.text == "Typed here"]
+        log("selftest text: finishing keeps the text where it was clicked:", len(typed) == 1
+            and abs(typed[0].x - 600) < 1 and abs(typed[0].y - 400) < 1 and self.editing is None)
+        x0, y0 = typed[0].x, typed[0].y
+        drag(x0 + 5, y0 + 5, x0 + 55, y0 + 55)
+        t1 = [i for i in self.items if i.kind == "text" and i.text == "Typed here"][0]
+        log("selftest text: dragging a text box moves it (and doesn't start typing):",
+            abs(t1.x - (x0 + 50)) < 1 and abs(t1.y - (y0 + 50)) < 1 and self.editing is None)
+        self.on_undo()
+        t1 = [i for i in self.items if i.kind == "text" and i.text == "Typed here"][0]
+        log("selftest text: undo puts it back:", abs(t1.x - x0) < 1 and abs(t1.y - y0) < 1)
+        click(t1.x + 5, t1.y + 5)
+        log("selftest text: a click on a text box types in it:", self.editing is not None and not self.editing["new"])
+        self.editor.get_buffer().set_text("")
+        self.finish_edit()
+        log("selftest text: emptying a box removes it:", not [i for i in self.items if i.text == "Typed here"])
+        self.begin(700, 450, 0.5, False)
+        self.finish()
+        self.finish_edit()
+        log("selftest text: a box left empty is not kept:", len([i for i in self.items if i.kind == "text"]) == n_items)
+        self.win.close()
+        return False
+    if mode == "look":
+        # not a check: saves pictures of the window ($PEN_NOTE_LOOK-select.png and -edit.png) so the screen can be looked at
+        line(100, 120, 380, 150)
+        line(100, 200, 380, 215)
+        line(100, 280, 380, 300)
+        self.commit_text(None, (450, 110), "Typed text box")
+        self.set_mode("move")
+        self._sel_strokes = list(self.strokes[:2])
+        self._sel_items = [i for i in self.items if i.kind == "text"]
+        self.marquee = (60, 90, 420, 230)
+
+        def shot(name):
+            w, h = self.win.get_width(), self.win.get_height()
+            paint = Gtk.WidgetPaintable.new(self.win)
+            s = Gtk.Snapshot()
+            paint.snapshot(s, w, h)
+            tex = self.get_renderer().render_texture(s.to_node(), Graphene.Rect().init(0, 0, w, h))
+            tex.save_to_png(os.environ["PEN_NOTE_LOOK"] + name)
+
+        def second():
+            shot("-edit.png")
+            self.win.close()
+            return False
+
+        def first():
+            shot("-select.png")
+            self.marquee = None
+            self.set_mode("text")
+            self.begin(450, 260, 0.5, False)
+            self.finish()
+            self.editor.get_buffer().set_text("Typing right here\nsecond line שלום")
+            GLib.timeout_add(500, second)
+            return False
+        GLib.timeout_add(500, first)
         return False
     if mode == "dialogs":
         os.environ["PEN_NOTE_CONFIG"] = tempfile.mkdtemp()

@@ -722,14 +722,36 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         def __init__(self, app):
             super().__init__(hexpand=True, vexpand=True, focusable=True)
             self.app = app
+            self.editor = None           # the text box being typed in, drawn on top of the surface
+            self.editor_pos = (0, 0)     # where it sits, in widget pixels
+
+        def set_editor(self, widget):
+            widget.set_parent(self)
+            self.editor = widget
+
+        def do_measure(self, orientation, for_size):
+            return 0, 0, -1, -1
+
+        def do_size_allocate(self, width, height, baseline):
+            ed = self.editor
+            if ed is not None and ed.get_visible():
+                w, h = self.app.editor_size()
+                rect = Gdk.Rectangle()
+                rect.x, rect.y, rect.width, rect.height = int(self.editor_pos[0]), int(self.editor_pos[1]), w, h
+                ed.size_allocate(rect, -1)
 
         def do_snapshot(self, snapshot):
             self.app.snapshot_view(snapshot, self.get_width(), self.get_height())
+            if self.editor is not None and self.editor.get_visible():
+                self.snapshot_child(self.editor, snapshot)
 
         def do_dispose(self):
             pop = getattr(self.app, "popover", None)
             if pop is not None and pop.get_parent() is self:
                 pop.unparent()
+            if self.editor is not None:
+                self.editor.unparent()
+                self.editor = None
             Gtk.Widget.do_dispose(self)
 
     class Stroke:
@@ -785,7 +807,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.erase_snapped = False
             self.strokes = []
             self.items = []           # pictures and text boxes
-            self.selected = None      # the item the Move tool has selected
+            self._sel_items, self._sel_strokes = [], []   # what the Select tool has selected
+            self.marquee = None       # the box being dragged to select several things (world pixels)
+            self.editing = None       # the text box being typed in: {"item", "new"}
+            self.last_click = None
+            self.drag_base = None
             self.undo_stack = []
             self.redo_stack = []
             self.current = None
@@ -847,7 +873,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return
             win = Gtk.ApplicationWindow(application=self, title="Pen Note")
             self.win = win
-            win.set_default_size(1100, 760)
+            win.set_default_size(1440, 800)
 
             outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
             win.set_child(outer)
@@ -918,7 +944,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             for name, label, tip in (("highlight", "Highlight", "Yellow highlighter"),
                                      ("edittext", "Edit text", "Change text that is already in a PDF page"),
                                      ("eraser", "Eraser", "Erase pen strokes"),
-                                     ("move", "Move", "Select, move and resize pictures and text"),
+                                     ("move", "Select", "Click a thing, or drag a box around several. Drag to move, Delete removes, a colour recolours"),
                                      ("text", "Text", "Tap to add a text box, tap one to edit it")):
                 b = Gtk.ToggleButton(label=label)
                 b.set_tooltip_text(tip)
@@ -951,6 +977,21 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
             self.area = Canvas(self)
             root.append(self.area)
+            self.editor = Gtk.TextView(wrap_mode=Gtk.WrapMode.NONE, visible=False, left_margin=0, right_margin=0,
+                                       top_margin=0, bottom_margin=0)
+            self.editor.add_css_class("pennote-editor")
+            self.editor_css = Gtk.CssProvider()
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.editor_css,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.area.set_editor(self.editor)
+            self.editor.get_buffer().connect("changed", lambda *_: self.area.queue_allocate())
+            ekeys = Gtk.EventControllerKey()
+            ekeys.connect("key-pressed", self.on_editor_key)
+            self.editor.add_controller(ekeys)
+            efocus = Gtk.EventControllerFocus()
+            efocus.connect("leave", lambda *_: GLib.idle_add(
+                lambda: (self.finish_edit() if self.editing and not self.editor.has_focus() else None, False)[1]))
+            self.editor.add_controller(efocus)
 
             info = Gtk.Box(spacing=12, margin_start=8, margin_end=8, margin_bottom=4, margin_top=2)
             self.spinner = Gtk.Spinner(visible=False)     # shown while slides are being converted
@@ -1046,8 +1087,127 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             width = min(720.0, 480.0 * tw / max(th, 1))
             self.items.append(Item("image", 40.0, 40.0, width=width, texture=tex, auto=True))
 
+        # ---- selection ---------------------------------------------------------
+        @property
+        def selected(self):
+            """The one item selected, or None (nothing, several things, or a stroke)."""
+            return self._sel_items[0] if len(self._sel_items) == 1 and not self._sel_strokes else None
+
+        @selected.setter
+        def selected(self, item):
+            self._sel_items = [item] if item is not None else []
+            self._sel_strokes = []
+
+        def sel_valid(self):
+            """(items, strokes) that are selected and still on the surface."""
+            on_items = {id(i) for i in self.items}
+            on_strokes = {id(st) for st in self.strokes}
+            return ([i for i in self._sel_items if id(i) in on_items],
+                    [st for st in self._sel_strokes if id(st) in on_strokes])
+
+        def hit_stroke(self, cx, cy):
+            tol = 6 / self.zoom
+            for st in reversed(self.strokes):
+                r = tol + st.width / 2
+                pts = st.pts
+                if len(pts) == 1:
+                    near = math.hypot(pts[0][0] - cx, pts[0][1] - cy) < r
+                else:
+                    near = any(seg_dist(cx, cy, a[0], a[1], b[0], b[1]) < r for a, b in zip(pts, pts[1:]))
+                if near:
+                    return st
+            return None
+
+        def hit_object(self, cx, cy):
+            """The topmost thing at a point: typed text, signature, pen stroke, patch, picture."""
+            return (self.hit_item(cx, cy, kinds=("text", "sign")) or self.hit_stroke(cx, cy)
+                    or self.hit_item(cx, cy, kinds=("cover", "image")))
+
+        def select_all(self):
+            self.set_mode("move")
+            self._sel_items = [i for i in self.items if not (i.kind == "image" and i.pdf)]
+            self._sel_strokes = list(self.strokes)
+            self.status.set_text(f"Selected {len(self._sel_items) + len(self._sel_strokes)} things. "
+                                 "Drag to move them, Delete to remove them.")
+            self.area.queue_draw()
+
+        # ---- typing text right on the surface -------------------------------------
+        def start_edit(self, item, wx=None, wy=None):
+            """Type in a text box in place. item=None starts a new box where the click was."""
+            self.finish_edit()
+            new = item is None
+            if new:
+                item = Item("text", wx, wy, text="", size=self.text_px / self.zoom, color=self.color)
+            self.editing = {"item": item, "new": new}
+            self.selected = None
+            self.editor.get_buffer().set_text(item.text)
+            self.editor.set_visible(True)
+            self.place_editor()
+            self.editor.grab_focus()
+            self.area.queue_draw()
+
+        def place_editor(self):
+            e = self.editing
+            if not e:
+                return
+            it = e["item"]
+            r, g, b = (int(c * 255) for c in it.color)
+            self.editor_css.load_from_string(
+                ".pennote-editor, .pennote-editor text { background: transparent; color: rgb(%d,%d,%d); "
+                "font-family: Sans; font-size: %.1fpx; padding: 0; margin: 0; }" % (r, g, b, max(it.size * self.zoom, 6.0)))
+            self.area.editor_pos = (it.x * self.zoom + self.ox, it.y * self.zoom + self.oy)
+            self.area.queue_allocate()
+
+        def editor_size(self):
+            """Pixel size of the text box being typed in: its text, plus room for the cursor."""
+            e = self.editing
+            if not e:
+                return 30, 20
+            buf = self.editor.get_buffer()
+            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+            layout = self.area.create_pango_layout(text + " ")
+            fd = Pango.FontDescription.from_string("Sans")
+            fd.set_absolute_size(max(e["item"].size * self.zoom, 6.0) * Pango.SCALE)
+            layout.set_font_description(fd)
+            w, h = layout.get_pixel_size()
+            return max(w + 6, 30), max(h + 2, 20)
+
+        def finish_edit(self, cancel=False):
+            e, self.editing = self.editing, None
+            if not e:
+                return
+            buf = self.editor.get_buffer()
+            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).rstrip()
+            self.editor.set_visible(False)
+            it = e["item"]
+            if not cancel:
+                if e["new"]:
+                    if text.strip():
+                        self.push_undo()
+                        it.text = text
+                        self.items.append(it)
+                        self.selected = it
+                elif not text.strip():
+                    self.push_undo()
+                    self.items = [i for i in self.items if i is not it]
+                    self.selected = None
+                elif text != it.text:
+                    self.push_undo()
+                    it.text = text
+                    self.selected = it
+            self.area.grab_focus()
+            self.area.queue_draw()
+
+        def on_editor_key(self, ctrl, keyval, keycode, state):
+            if keyval == Gdk.KEY_Escape or (keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+                                            and state & Gdk.ModifierType.CONTROL_MASK):
+                self.finish_edit()                           # Esc or Ctrl+Enter: done, keep what was typed
+                return True
+            return False
+
         # ---- tools ----------------------------------------------------------
         def set_mode(self, mode):
+            self.finish_edit()
             self._mode_lock = True
             self.mode = mode
             for name, b in self.mode_btns.items():
@@ -1065,8 +1225,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 "edittext": "Tool: Edit text (click a line of text in a PDF, retype it, click away to finish)",
                 "highlight": "Tool: Highlight (yellow, for marking text)",
                 "eraser": "Tool: Eraser (pen strokes only)",
-                "move": "Tool: Move (pen drags pictures and text; pick a color to draw)",
-                "text": "Tool: Text (tap to place; pick a color to draw)",
+                "move": "Tool: Select (click a thing or drag a box around several, then drag to move; Delete removes)",
+                "text": "Tool: Text (click and type right there; drag a text box to move it; pick a color to draw)",
             }[self.mode])
 
         def on_mode_toggled(self, btn, name):
@@ -1080,6 +1240,21 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         def on_color(self, btn, rgb):
             if btn.get_active():
                 self.color = rgb
+                items, strokes = self.sel_valid()
+                if self.mode == "move" and (items or strokes):   # a colour picked with things selected recolours them
+                    self.push_undo()
+                    for i in items:
+                        if i.kind == "text":
+                            i.color = rgb
+                    fresh = {}
+                    for st in strokes:
+                        c = Stroke(rgb, st.width, st.alpha)
+                        c.pts = list(st.pts)
+                        fresh[id(st)] = c
+                    self.strokes = [fresh.get(id(st), st) for st in self.strokes]
+                    self._sel_strokes = [fresh[id(st)] for st in strokes]
+                    self.area.queue_draw()
+                    return
                 if self.mode in ("eraser", "move", "highlight", "edittext"):  # picking a color means "draw"
                     self.set_mode("pen")
 
@@ -1120,13 +1295,19 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.area.queue_draw()
 
         def on_delete_selected(self, *_):
-            if self.selected in self.items:
-                self.push_undo()
-                self.items = [i for i in self.items if i is not self.selected]
-                self.selected = None
-                self.area.queue_draw()
+            items, strokes = self.sel_valid()
+            if not (items or strokes):
+                return
+            self.push_undo()
+            drop_items, drop_strokes = {id(i) for i in items}, {id(st) for st in strokes}
+            self.items = [i for i in self.items if id(i) not in drop_items]
+            self.strokes = [st for st in self.strokes if id(st) not in drop_strokes]
+            self.selected = None
+            self.area.queue_draw()
 
         def on_window_key(self, ctrl, keyval, keycode, state):
+            if self.editing:                                 # typing: the text box gets the keys
+                return False
             ctrl_down = bool(state & Gdk.ModifierType.CONTROL_MASK)
             shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
             if ctrl_down and keyval in (Gdk.KEY_v, Gdk.KEY_V):
@@ -1135,6 +1316,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.on_redo() if shift else self.on_undo()
             elif ctrl_down and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
                 self.on_redo()
+            elif ctrl_down and keyval in (Gdk.KEY_a, Gdk.KEY_A):
+                self.select_all()
+            elif keyval == Gdk.KEY_Escape and (self._sel_items or self._sel_strokes):
+                self.selected = None
+                self.area.queue_draw()
             elif keyval == Gdk.KEY_F11:                      # full screen on / off
                 self.win.unfullscreen() if self.win.is_fullscreen() else self.win.fullscreen()
             elif keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
@@ -1158,6 +1344,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.zoom = min(max(zoom, MIN_ZOOM), MAX_ZOOM)
             self.ox, self.oy = ox, oy
             self.area.queue_draw()
+            if self.editing:
+                self.place_editor()
 
         def zoom_by(self, factor, px=None, py=None):
             w, h = self.canvas_size()
@@ -1211,7 +1399,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             item = Item("image", cx - width / 2, cy - width * th / tw / 2, width=width, texture=texture)
             self.items.append(item)
             self.selected = item           # stays in the current tool, so the pen keeps drawing
-            self.status.set_text("Picture added. Choose Move to drag it or resize it by its corner.")
+            self.status.set_text("Picture added. Choose Select to drag it or resize it by its corner.")
             self.area.queue_draw()
 
         def on_drop(self, target, value, x, y):
@@ -1521,11 +1709,15 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         def on_text_size(self, scale):
             self.text_px = scale.get_value()
-            sel = self.selected
-            if sel is not None and sel in self.items and sel.kind == "text":
-                sel.size = self.text_px / self.zoom
+            texts = [i for i in self.sel_valid()[0] if i.kind == "text"]
+            if texts:
+                for t in texts:
+                    t.size = self.text_px / self.zoom
                 self.dirty = True
                 self.area.queue_draw()
+            if self.editing:
+                self.editing["item"].size = self.text_px / self.zoom
+                self.place_editor()
 
         def page_colours(self, page, rect):
             """(background, ink) colours of the page picture around and inside rect, as 0..1 triples."""
@@ -1566,8 +1758,9 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         def edit_text_begin(self, x, y):
             wx, wy = self.to_world(x, y)
-            if self.hit_item(wx, wy, kinds=("text",)):
-                self.text_begin(x, y)                        # text you typed: edit it as usual
+            typed = self.hit_item(wx, wy, kinds=("text",))
+            if typed:
+                self.start_edit(typed)                       # text you typed: edit it in place
                 return
             page = next((p for p in self.pdf_pages()
                          if self.item_box(p)[0] <= wx <= self.item_box(p)[0] + self.item_box(p)[2]
@@ -1644,6 +1837,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         # ---- input -----------------------------------------------------------
         def begin(self, x, y, pressure, erase):
+            self.finish_edit()                                 # any click ends the text being typed
             self.area.grab_focus()
             self.erasing = False
             self.current = None
@@ -1652,8 +1846,16 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.move_begin(x, y)
                 return
             if not erase and self.mode == "text":
-                self.gesture_tool = "text"
-                self.text_begin(x, y)
+                wx, wy = self.to_world(x, y)
+                hit = self.hit_item(wx, wy, kinds=("text",))
+                if hit is not None:                            # press on a text box: drag moves it, a click edits it
+                    self.gesture_tool = "textdrag"
+                    self.selected = hit
+                    self.text_press = {"item": hit, "start": (wx, wy), "base": (hit.x, hit.y), "moved": False}
+                else:                                          # empty spot: a new text box, typed in right there
+                    self.gesture_tool = "text"
+                    self.start_edit(None, wx, wy)
+                self.area.queue_draw()
                 return
             if not erase and self.mode == "edittext":
                 self.gesture_tool = "text"                      # nothing to drag: one click
@@ -1682,6 +1884,17 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             if tool == "move":
                 self.move_extend(x, y)
                 return
+            if tool == "textdrag":
+                tp = self.text_press
+                wx, wy = self.to_world(x, y)
+                if not tp["moved"]:
+                    if math.hypot(wx - tp["start"][0], wy - tp["start"][1]) * self.zoom < 4:
+                        return                                 # still a click
+                    self.push_undo()
+                    tp["moved"] = True
+                tp["item"].x, tp["item"].y = tp["base"][0] + wx - tp["start"][0], tp["base"][1] + wy - tp["start"][1]
+                self.area.queue_draw()
+                return
             if tool not in ("draw", "erase"):
                 return
             wx, wy = self.to_world(x, y)
@@ -1692,8 +1905,49 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.area.queue_draw()
 
         def finish(self):
+            tool, grab = self.gesture_tool, self.grab
             self.current = None
             self.grab = None
+            if tool == "textdrag" and not self.text_press["moved"]:
+                self.start_edit(self.text_press["item"])       # a click on a text box: type in it
+            elif tool == "move" and grab:
+                if grab[0] == "marquee":
+                    self.marquee_done(grab)
+                elif grab[0] == "drag" and not self.grab_snapped:     # a click, not a drag
+                    hit, now = self.press_hit, time.monotonic()
+                    if isinstance(hit, Item) and hit.kind == "text":
+                        if self.last_click and self.last_click[1] is hit and now - self.last_click[0] < 0.45:
+                            self.last_click = None
+                            self.start_edit(hit)               # double click: type in it
+                        else:
+                            self.last_click = (now, hit)
+            self.marquee = None
+            self.area.queue_draw()
+
+        def marquee_done(self, grab):
+            x0, y0, x1, y1 = self.marquee
+            rx, ry, rw, rh = min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)
+            if rw * self.zoom < 4 and rh * self.zoom < 4:
+                return                                          # a click: what was clicked stays selected
+            def touches(bx, by, bw, bh):
+                return bx <= rx + rw and bx + bw >= rx and by <= ry + rh and by + bh >= ry
+            items = []
+            for it in self.items:
+                bx, by, bw, bh = self.item_box(it)
+                if it.kind == "image" and it.pdf:               # a whole page only when the box holds all of it
+                    if rx <= bx and ry <= by and bx + bw <= rx + rw and by + bh <= ry + rh:
+                        items.append(it)
+                elif touches(bx, by, bw, bh):
+                    items.append(it)
+            strokes = []
+            for st in self.strokes:
+                xs, ys = [p[0] for p in st.pts], [p[1] for p in st.pts]
+                if touches(min(xs) - st.width, min(ys) - st.width, max(xs) - min(xs) + 2 * st.width,
+                           max(ys) - min(ys) + 2 * st.width):
+                    strokes.append(st)
+            self._sel_items, self._sel_strokes = items, strokes
+            n = len(items) + len(strokes)
+            self.status.set_text(f"Selected {n} thing{'s' if n != 1 else ''}. Drag to move, Delete to remove." if n else "")
 
         def erase_at(self, wx, wy):
             r = self.eraser_px * 1.1 / self.zoom  # same size on screen whatever the zoom
@@ -1709,20 +1963,32 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.erase_snapped = True
                 self.strokes = kept
 
-        # Move tool: select a picture or text, drag to move, drag the corner square to resize
+        # Select tool: click a thing, or drag a box around several; drag to move; the corner square resizes
         def move_begin(self, x, y):
             cx, cy = self.to_world(x, y)
-            self.grab, self.grab_snapped = None, False
-            sel = self.selected if self.selected in self.items else None
+            self.grab, self.grab_snapped, self.press_hit = None, False, None
+            sel = self.selected
             if sel is not None:
                 bx, by, bw, bh = self.item_box(sel)
                 if math.hypot(cx - (bx + bw), cy - (by + bh)) < 18 / self.zoom:
                     self.grab = ("resize", sel, bw, sel.size)
-            if self.grab is None:
-                it = self.hit_item(cx, cy)
-                self.selected = it
-                if it is not None:
-                    self.grab = ("move", it, cx - it.x, cy - it.y)
+                    self.area.queue_draw()
+                    return
+            hit = self.hit_object(cx, cy)
+            items, strokes = self.sel_valid()
+            if hit is not None and not (any(hit is i for i in items) or any(hit is st for st in strokes)):
+                self._sel_items, self._sel_strokes = ([hit], []) if isinstance(hit, Item) else ([], [hit])
+                items, strokes = self.sel_valid()
+            self.press_hit = hit
+            if hit is None:                                     # empty space: start a selection box
+                self.selected = None
+                self.grab, self.marquee = ("marquee", None, cx, cy), (cx, cy, cx, cy)
+            elif isinstance(hit, Item) and hit.pdf:             # a PDF page: a click selects it, a drag draws a box
+                self.grab, self.marquee = ("marquee", hit, cx, cy), (cx, cy, cx, cy)
+            else:
+                self.grab = ("drag", None, cx, cy)
+                self.drag_base = {"items": [(i, i.x, i.y) for i in items],
+                                  "strokes": [(st, list(st.pts)) for st in strokes]}
             self.area.queue_draw()
 
         def move_extend(self, x, y):
@@ -1730,12 +1996,36 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return
             cx, cy = self.to_world(x, y)
             kind, it, a, b = self.grab
+            if kind == "marquee":
+                self.marquee = (a, b, cx, cy)
+                self.area.queue_draw()
+                return
+            if kind == "drag":
+                dx, dy = cx - a, cy - b
+                if not self.grab_snapped:
+                    if math.hypot(dx, dy) * self.zoom < 3:
+                        return                                  # still a click
+                    self.push_undo()                            # stores the old positions
+                    self.grab_snapped = True
+                    fresh = {}                                  # moved strokes are new objects: Undo keeps the old ones
+                    for k, (st, pts) in enumerate(self.drag_base["strokes"]):
+                        c = Stroke(st.color, st.width, st.alpha)
+                        c.pts = list(pts)
+                        fresh[id(st)] = c
+                        self.drag_base["strokes"][k] = (c, pts)
+                    self.strokes = [fresh.get(id(st), st) for st in self.strokes]
+                    self._sel_strokes = [fresh.get(id(st), st) for st in self._sel_strokes]
+                for item, bx, by in self.drag_base["items"]:
+                    item.x, item.y = bx + dx, by + dy
+                for c, pts in self.drag_base["strokes"]:
+                    c.pts = [(px + dx, py + dy, pr) for px, py, pr in pts]
+                    c.cache = None
+                self.area.queue_draw()
+                return
             if not self.grab_snapped:        # first real change: remember the state for Undo
                 self.push_undo()             # runs before the change below, so it stores the old position
                 self.grab_snapped = True
-            if kind == "move":
-                it.x, it.y = cx - a, cy - b
-            elif it.kind == "cover":
+            if it.kind == "cover":
                 it.width, it.size = max(cx - it.x, 4.0), max(cy - it.y, 4.0)
             elif it.kind in ("image", "sign"):
                 it.width = max(cx - it.x, 12.0)
@@ -1887,7 +2177,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         for path, stroke in stroke_runs(st):
                             snapshot.append_stroke(path, stroke, rgba)
             for it in self.items:                                  # text, above the pen
-                if it.kind == "text":
+                if it.kind == "text" and not (self.editing and it is self.editing["item"]):
                     rgba = Gdk.RGBA()
                     rgba.red, rgba.green, rgba.blue = it.color
                     rgba.alpha = 1.0
@@ -1895,15 +2185,36 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     snapshot.translate(Graphene.Point().init(it.x, it.y))
                     snapshot.append_layout(self.make_layout(it), rgba)
                     snapshot.restore()
-            if not export and self.selected in self.items:         # selection outline + resize handle
-                bx, by, bw, bh = self.item_box(self.selected)
+            if not export:                                         # what is selected, the selection box, the text frame
                 blue = Gdk.RGBA()
                 blue.red, blue.green, blue.blue, blue.alpha = 0.1, 0.45, 0.95, 1.0
-                pb = Gsk.PathBuilder.new()
-                pb.add_rect(Graphene.Rect().init(bx, by, bw, bh))
-                snapshot.append_stroke(pb.to_path(), Gsk.Stroke.new(2 / self.zoom), blue)
-                hs = 12 / self.zoom
-                snapshot.append_color(blue, Graphene.Rect().init(bx + bw - hs / 2, by + bh - hs / 2, hs, hs))
+
+                def outline(x, y, w, h, thick):
+                    pb = Gsk.PathBuilder.new()
+                    pb.add_rect(Graphene.Rect().init(x, y, w, h))
+                    snapshot.append_stroke(pb.to_path(), Gsk.Stroke.new(thick / self.zoom), blue)
+                items, strokes = self.sel_valid()
+                for it in items:
+                    outline(*self.item_box(it), 2)
+                for st in strokes:
+                    xs, ys = [p[0] for p in st.pts], [p[1] for p in st.pts]
+                    pad = st.width / 2 + 3 / self.zoom
+                    outline(min(xs) - pad, min(ys) - pad, max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad, 1.5)
+                if self.selected in self.items:                    # resize handle on a single item
+                    bx, by, bw, bh = self.item_box(self.selected)
+                    hs = 12 / self.zoom
+                    snapshot.append_color(blue, Graphene.Rect().init(bx + bw - hs / 2, by + bh - hs / 2, hs, hs))
+                if self.editing:                                   # a frame around the text box being typed
+                    e = self.editing["item"]
+                    ew, eh = self.editor_size()
+                    outline(e.x - 2 / self.zoom, e.y - 2 / self.zoom, ew / self.zoom + 4 / self.zoom,
+                            eh / self.zoom + 4 / self.zoom, 1)
+                if self.marquee:
+                    x0, y0, x1, y1 = self.marquee
+                    fill = Gdk.RGBA()
+                    fill.red, fill.green, fill.blue, fill.alpha = 0.1, 0.45, 0.95, 0.12
+                    snapshot.append_color(fill, Graphene.Rect().init(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)))
+                    outline(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0), 1)
 
         def content_bounds(self):
             """(x, y, width, height) around everything on the surface, plus a margin."""
