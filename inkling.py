@@ -6,7 +6,7 @@
                                      open the canvas directly (also used by the daemon and
                                      "Open with Inkling": .inkling notes, pictures, slides)
 
-Each save writes, into the Obsidian vault: a PNG of everything on the canvas, a markdown
+Each save writes, into Inkling's own notes folder (Documents/Inkling, or the one you choose): a PNG of everything on the canvas, a markdown
 note that embeds it (with an "Edit in Inkling" link), and a hidden editable copy so the note
 can be opened and continued. "Save PDF" keeps opened PDF pages sharp and puts your marks on top.
 
@@ -40,10 +40,76 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
-VAULT = Path.home() / "Obsidian" / "Main"
-NOTES_DIR = Path(os.environ.get("INKLING_DIR") or VAULT / "Inkling")
-PROJECT_DIR = NOTES_DIR / ".inkling"   # hidden: Obsidian ignores dot-folders
 SELF = Path(__file__).resolve()
+
+
+def config_dir():
+    return Path(os.environ.get("INKLING_CONFIG") or Path.home() / ".config" / "inkling")
+
+
+def user_dir(name, fallback):
+    """A folder of the user's desktop setup (DOCUMENTS, DOWNLOAD…), wherever this computer keeps it."""
+    try:
+        text = (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "user-dirs.dirs").read_text()
+        m = re.search(rf'^XDG_{name}_DIR="?([^"\n]+)"?', text, re.M)
+        if m:
+            return Path(m.group(1).replace("$HOME", str(Path.home())))
+    except OSError:
+        pass
+    return Path.home() / fallback
+
+
+def default_notes_dir():
+    """Where Inkling keeps its notes: INKLING_DIR, else the folder chosen in the app, else an Inkling folder that
+    already exists from earlier use, else Documents/Inkling (its own folder, made when it is first needed)."""
+    if os.environ.get("INKLING_DIR"):
+        return Path(os.environ["INKLING_DIR"])
+    try:
+        chosen = json.loads((config_dir() / "settings.json").read_text()).get("notes_dir")
+    except (OSError, ValueError):
+        chosen = None
+    if chosen:
+        return Path(chosen)
+    for old in (Path.home() / "Obsidian" / "Main" / "Inkling", Path.home() / "Obsidian" / "Main" / "Pen Notes"):
+        if old.is_dir():                                     # notes saved before the folder was a setting
+            return old
+    return user_dir("DOCUMENTS", "Documents") / "Inkling"
+
+
+NOTES_DIR = default_notes_dir()
+PROJECT_DIR = NOTES_DIR / ".inkling"   # hidden, so a notes app that scans the folder ignores it
+
+
+def set_notes_dir(path):
+    """Keep notes in another folder from now on (and remember it for next time)."""
+    global NOTES_DIR, PROJECT_DIR
+    NOTES_DIR, PROJECT_DIR = Path(path), Path(path) / ".inkling"
+    try:
+        (config_dir()).mkdir(parents=True, exist_ok=True)
+        f = config_dir() / "settings.json"
+        try:
+            settings = json.loads(f.read_text())
+        except (OSError, ValueError):
+            settings = {}
+        settings["notes_dir"] = str(NOTES_DIR)
+        f.write_text(json.dumps(settings))
+    except OSError:
+        pass
+
+
+def missing_dependencies():
+    """[(what it is needed for, how to get it)] for the helpers this computer lacks. Empty when all is well."""
+    out = []
+    for tool, what in (("pdftoppm", "showing PDF pages"), ("pdftotext", "reading the text of PDFs")):
+        if not shutil.which(tool):
+            out.append((what, "poppler-utils"))
+    for mod, what, pkg in (("pypdf", "saving and editing PDFs", "python3-pypdf, or: pip install pypdf"),
+                           ("cairo", "drawing into PDFs", "python3-cairo")):
+        try:
+            __import__(mod)
+        except ImportError:
+            out.append((what, pkg))
+    return out
 
 # --- double-tap tuning (my defaults, tweak here) -----------------------------
 TAP_MAX_DURATION = 0.30    # a tap is a touch shorter than this (seconds)
@@ -245,7 +311,9 @@ SLIDE_GAP_RATIO = 0.6       # blank space after each slide, as a fraction of the
 MAX_SLIDES = 2000
 # The snap-packaged LibreOffice can only read non-hidden folders inside your home folder,
 # so decks are copied into this work folder (and removed again) for conversion.
-WORK_DIR = SELF.parent / "work"
+# scratch space: next to the program if that can be written to, else in the user's cache
+WORK_DIR = (SELF.parent / "work") if os.access(SELF.parent, os.W_OK) else Path(
+    os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "inkling" / "work"
 EXPORT_MAX_PAGES = 40       # PDF pages drawn into the saved PNG preview (the rest show as grey boxes)
 PAGE_TEXTURES = 24          # PDF pages kept drawn in memory; the others are drawn again when you scroll back
 # The PDF behind every page (an opened PDF, a converted deck, a turned copy). A saved note carries its
@@ -441,10 +509,6 @@ class PasswordNeeded(Exception):
     def __init__(self, wrong=False):
         super().__init__("password needed")
         self.wrong = wrong
-
-
-def config_dir():
-    return Path(os.environ.get("INKLING_CONFIG") or Path.home() / ".config" / "inkling")
 
 
 def make_certificate(name, email, password, path):
@@ -840,13 +904,13 @@ class Doc:
         self.pending, self.deck_state = {}, {}
 
 
-EXPORT_FORMATS = (("pdf", "PDF"),
+EXPORT_FORMATS = (("inkling", "Inkling note (.inkling), to keep or share"), ("pdf", "PDF"),
                   ("docx-pages", "Word (.docx), pages as pictures"), ("docx", "Word (.docx), editable text"),
                   ("pptx", "PowerPoint (.pptx), pages as slides"),
                   ("odt", "OpenDocument text (.odt)"), ("rtf", "Rich text (.rtf)"),
                   ("txt", "Plain text (.txt)"), ("png", "Pictures (.png, one per page)"))
 # format -> (file ending, the office app that writes it; None = Inkling does it itself)
-EXPORT_INFO = {"pdf": ("pdf", None), "docx-pages": ("docx", "wordcraft"), "docx": ("docx", "wordcraft"),
+EXPORT_INFO = {"inkling": ("inkling", None), "pdf": ("pdf", None), "docx-pages": ("docx", "wordcraft"), "docx": ("docx", "wordcraft"),
                "pptx": ("pptx", "deckcraft"), "odt": ("odt", "wordcraft"), "rtf": ("rtf", "wordcraft"),
                "txt": ("txt", None), "png": ("png", None)}
 # what LibreOffice can write from a PDF, if it is installed (the editable kinds only)
@@ -1238,7 +1302,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 item = Gtk.Button()
                 item.add_css_class("flat")
                 item.set_child(self.icon_label(label, f"ai.storyteller.{app}" if app else
-                                               {"pdf": "application-pdf", "txt": "text-x-generic",
+                                               {"inkling": "inkling", "pdf": "application-pdf", "txt": "text-x-generic",
                                                 "png": "image-x-generic"}[fmt])[0])
                 item.connect("clicked", lambda _b, f=fmt: (popover.popdown(), self.export_as(f)))
                 plist.append(item)
@@ -1253,8 +1317,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             popover.set_child(plist)
             menu.set_popover(popover)
             bar.append(menu)
-            save = add_button(bar, "Save", lambda *_: self.save(notify=True))
-            save.add_css_class("suggested-action")
+            self.save_btn = add_button(bar, "Save", lambda *_: self.save(notify=True))
+            self.save_btn.add_css_class("suggested-action")
 
             # row 2: tools
             bar = new_bar()
@@ -1418,6 +1482,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
             win.present()
             prune_pdf_store()
+            self.refresh_folder()
+            missing = missing_dependencies()
+            if missing:
+                self.status.set_text("Some helpers are missing: " + "; ".join(f"{what} needs {pkg}" for what, pkg in missing))
             self.refresh_recent()
             self.refresh_tabs()
             self.area.grab_focus()
@@ -1836,6 +1904,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.on_redo() if shift else self.on_undo()
             elif ctrl_down and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
                 self.on_redo()
+            elif ctrl_down and keyval in (Gdk.KEY_s, Gdk.KEY_S):
+                if shift:
+                    self.export_as("inkling")                    # Ctrl+Shift+S: save a copy somewhere you choose
+                else:
+                    self.save(notify=True)                       # Ctrl+S: into Inkling's own folder
             elif ctrl_down and keyval in (Gdk.KEY_b, Gdk.KEY_B):
                 self.nav_btn.set_active(not self.nav_btn.get_active())
             elif ctrl_down and keyval in (Gdk.KEY_a, Gdk.KEY_A):
@@ -2092,10 +2165,51 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             head("RECENT", "recent")
             self.recent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             add(self.recent_box)
+            head("SAVED IN", "folder")
+            self.folder_btn = Gtk.Button()
+            self.folder_btn.add_css_class("flat")
+            box, self.folder_label = self.icon_label("", "folder")
+            self.folder_btn.set_child(box)
+            self.folder_btn.connect("clicked", self.open_notes_folder)
+            add(self.folder_btn)
+            button("Change folder…", self.choose_notes_folder, "Choose where Inkling keeps your notes")
             sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
             sc.set_min_content_width(110)
             sc.set_child(side)
             return sc
+
+        def refresh_folder(self):
+            """Show where notes are kept: on the folder button, and on the Save button."""
+            if getattr(self, "folder_label", None) is not None:
+                self.folder_label.set_text(NOTES_DIR.name or str(NOTES_DIR))
+                self.folder_btn.set_tooltip_text(f"{NOTES_DIR}\nClick to open it")
+            if getattr(self, "save_btn", None) is not None:
+                self.save_btn.set_tooltip_text(
+                    f"Saves in {NOTES_DIR}. Inkling also saves by itself when you close a tab or the window. "
+                    "To keep a copy somewhere else: Export > Inkling note (Ctrl+Shift+S).")
+
+        def open_notes_folder(self, *_):
+            try:
+                NOTES_DIR.mkdir(parents=True, exist_ok=True)
+                Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(str(NOTES_DIR)).get_uri(), None)
+            except (OSError, GLib.Error) as e:
+                self.status.set_text(f"Could not open {NOTES_DIR}: {e}")
+
+        def choose_notes_folder(self, *_):
+            dlg = Gtk.FileDialog(title="Where should Inkling keep your notes?")
+            if NOTES_DIR.is_dir():
+                dlg.set_initial_folder(Gio.File.new_for_path(str(NOTES_DIR)))
+
+            def done(d, res):
+                try:
+                    f = d.select_folder_finish(res)
+                except GLib.Error:
+                    return                                       # cancelled
+                set_notes_dir(f.get_path())
+                self.refresh_folder()
+                self.refresh_recent()
+                self.status.set_text(f"Notes are saved in {NOTES_DIR} from now on. Earlier notes stay where they were.")
+            dlg.select_folder(self.win, None, done)
 
         def refresh_recent(self):
             box = getattr(self, "recent_box", None)
@@ -2737,6 +2851,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             if tex is None:
                 tex = Gdk.Texture.new_from_bytes(GLib.Bytes.new(render_pdf_page(key[0], key[1] + 1)))
                 self.tex_cache[key] = tex
+                while len(self.tex_cache) > PAGE_TEXTURES:       # the picture being made keeps its own copies
+                    self.tex_cache.popitem(last=False)
             return tex
 
         def page_texture(self, key):
@@ -3189,6 +3305,17 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.run_export(fmt, target, name)
 
         def run_export(self, fmt, target, name, done=None):
+            if fmt == "inkling":                                 # a copy of the note itself, wherever you chose
+                try:
+                    self.write_project(target)
+                    err, msg = None, f"Saved a copy of this note: {target}"
+                except Exception as e:  # noqa: BLE001
+                    log("copy failed:", e)
+                    err, msg = str(e), ""
+                self.status.set_text(f"Could not save the copy: {err}" if err else msg)
+                if done:
+                    done(err, msg)
+                return
             try:
                 PDF_STORE.mkdir(parents=True, exist_ok=True)
                 tmp_pdf = PDF_STORE / f"prot-export-{os.getpid()}-{time.time_ns()}.pdf"   # cleared at next start
@@ -3814,7 +3941,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.saved_base = base
                 self.dirty = False
                 self.update_title()
-                self.status.set_text(f"Saved: Inkling/{base}")
+                self.status.set_text(f"Saved in {NOTES_DIR}: {base}")
                 self.refresh_recent()
                 self.refresh_tabs()
                 return True

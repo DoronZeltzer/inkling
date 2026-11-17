@@ -623,11 +623,86 @@ def run(self):
             return False
         GLib.timeout_add(900, shot)
         return False
+    if mode == "folders":
+        import __main__ as host                                       # the running app (not a second copy of the module)
+        d = tempfile.mkdtemp()
+        saved_env = {k: os.environ.get(k) for k in ("HOME", "XDG_CONFIG_HOME", "INKLING_DIR", "INKLING_CONFIG", "PATH")}
+        os.environ["INKLING_CONFIG"] = f"{d}/cfg"
+        real_dir = host.NOTES_DIR
+        os.environ.pop("INKLING_DIR")
+        home = Path(d) / "home"
+        home.mkdir()
+        os.environ["HOME"] = str(home)
+        os.environ["XDG_CONFIG_HOME"] = str(home / ".config")
+        log("selftest folders: a fresh computer keeps notes in Documents/Inkling:",
+            host.default_notes_dir() == home / "Documents" / "Inkling")
+        (home / ".config").mkdir()
+        (home / ".config" / "user-dirs.dirs").write_text('XDG_DOCUMENTS_DIR="$HOME/Dokumente"\n')
+        log("selftest folders: ...in the Documents folder this computer actually uses:",
+            host.default_notes_dir() == home / "Dokumente" / "Inkling")
+        (home / "Obsidian" / "Main" / "Inkling").mkdir(parents=True)
+        log("selftest folders: an Inkling folder from earlier use is kept:",
+            host.default_notes_dir() == home / "Obsidian" / "Main" / "Inkling")
+        chosen = Path(d) / "my notes"
+        host.set_notes_dir(chosen)
+        settings = json.loads((Path(d) / "cfg" / "settings.json").read_text())
+        log("selftest folders: a folder chosen in the app wins and is remembered:",
+            host.NOTES_DIR == chosen and host.default_notes_dir() == chosen and settings["notes_dir"] == str(chosen))
+        os.environ["INKLING_DIR"] = str(Path(d) / "env")
+        log("selftest folders: INKLING_DIR overrides everything:", host.default_notes_dir() == Path(d) / "env")
+        os.environ.pop("INKLING_DIR")
+
+        # saving goes to the folder, and the panel and the Save button say where
+        self.refresh_folder()
+        line(100, 100, 300, 160)
+        self.name_entry.set_text("where am I")
+        ok = self.save()
+        log("selftest folders: Save puts the note in the chosen folder:", ok and (chosen / "where am I.md").exists()
+            and (chosen / ".inkling" / "where am I.inkling").exists(),
+            "| the panel shows the folder:", self.folder_label.get_text() == "my notes",
+            "| the Save button's hint names it:", str(chosen) in (self.save_btn.get_tooltip_text() or ""))
+
+        # a copy somewhere else, asked for by the user
+        elsewhere = Path(d) / "elsewhere" / "copy.inkling"
+        elsewhere.parent.mkdir()
+        got = []
+        self.run_export("inkling", elsewhere, "copy", done=lambda err, msg: got.append(err))
+        strokes, items, _view = self.read_project(elsewhere)
+        log("selftest folders: 'Save a copy as' writes a note file where chosen, and it opens again:",
+            got == [None] and len(strokes) == len(self.strokes) and not (chosen / "copy.md").exists())
+
+        # helpers missing on a computer: it says what to install
+        os.environ["PATH"] = ""
+        gone = host.missing_dependencies()
+        os.environ["PATH"] = saved_env["PATH"]
+        log("selftest folders: a missing helper is named, with the package:", any("poppler-utils" in pkg for _w, pkg in gone))
+
+        # the installer works from wherever the folder is, for whoever runs it
+        fake = Path(d) / "fakehome"
+        fake.mkdir()
+        r = subprocess.run(["bash", str(Path(host.SELF).parent / "install.sh"), "--no-pen"], capture_output=True, text=True,
+                           env={**os.environ, "HOME": str(fake), "XDG_DATA_HOME": "", "XDG_CONFIG_HOME": ""})
+        entry = fake / ".local/share/applications/local.inkling.canvas.desktop"
+        text = entry.read_text() if entry.exists() else ""
+        log("selftest folders: install.sh sets up the launcher for that user, pointing at this folder:",
+            r.returncode == 0 and str(Path(host.SELF).parent / "inkling.py") in text
+            and (fake / ".local/share/icons/hicolor/scalable/apps/inkling.svg").exists()
+            and (fake / ".local/share/mime/packages/inkling.xml").exists(), "|", (r.stdout + r.stderr).strip().splitlines()[-1:])
+
+        for k, v in saved_env.items():                                  # leave everything as it was
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        host.NOTES_DIR, host.PROJECT_DIR = real_dir, real_dir / ".inkling"
+        shutil.rmtree(d, ignore_errors=True)
+        self.win.close()
+        return False
     if mode == "sections":
         d = tempfile.mkdtemp()
         os.environ["INKLING_CONFIG"] = f"{d}/cfg"
-        keys = ["tabs", "open", "pdf", "sign", "recent"]
-        log("selftest sections: all five sections have a fold arrow and start open:", list(self.sections) == keys
+        keys = ["tabs", "open", "pdf", "sign", "recent", "folder"]
+        log("selftest sections: every section has a fold arrow and start open:", list(self.sections) == keys
             and all(r.get_reveal_child() for r, _a in self.sections.values()))
         rev, arrow = self.sections["pdf"]
         arrow.emit("clicked")
