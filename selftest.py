@@ -606,6 +606,50 @@ def run(self):
             self.add_slide_file(paths[1], done=lambda: self.add_slide_file(paths[2], done=step3))
         self.add_slide_file(paths[0], done=after_a)
         return False
+    if mode == "look4":
+        # not a check: the side panel with some sections folded ($INKLING_LOOK-sections.png)
+        os.environ["INKLING_CONFIG"] = tempfile.mkdtemp()
+        self.sections["open"][1].emit("clicked")
+        self.sections["sign"][1].emit("clicked")
+
+        def shot():
+            w, h = self.win.get_width(), self.win.get_height()
+            paint = Gtk.WidgetPaintable.new(self.win)
+            s = Gtk.Snapshot()
+            paint.snapshot(s, w, h)
+            tex = self.get_renderer().render_texture(s.to_node(), Graphene.Rect().init(0, 0, w, h))
+            tex.save_to_png(os.environ["INKLING_LOOK"] + "-sections.png")
+            self.win.close()
+            return False
+        GLib.timeout_add(900, shot)
+        return False
+    if mode == "sections":
+        d = tempfile.mkdtemp()
+        os.environ["INKLING_CONFIG"] = f"{d}/cfg"
+        keys = ["tabs", "open", "pdf", "sign", "recent"]
+        log("selftest sections: all five sections have a fold arrow and start open:", list(self.sections) == keys
+            and all(r.get_reveal_child() for r, _a in self.sections.values()))
+        rev, arrow = self.sections["pdf"]
+        arrow.emit("clicked")
+        GLib.timeout_add(400, lambda: check(rev, arrow))
+
+        def check(rev, arrow):
+            log("selftest sections: the arrow folds a section away (and only that one):", not rev.get_reveal_child()
+                and not rev.get_child_revealed() and all(self.sections[k][0].get_reveal_child() for k in keys if k != "pdf"),
+                "| arrow points sideways:", arrow.get_icon_name() == "pan-end-symbolic")
+            saved = json.loads((Path(d) / "cfg" / "window.json").read_text())
+            log("selftest sections: it is remembered for next time:", saved["closed_sections"] == ["pdf"])
+            arrow.emit("clicked")
+            GLib.timeout_add(400, lambda: check2(rev, arrow))
+            return False
+
+        def check2(rev, arrow):
+            log("selftest sections: the arrow opens it again:", rev.get_reveal_child() and arrow.get_icon_name() == "pan-down-symbolic"
+                and json.loads((Path(d) / "cfg" / "window.json").read_text())["closed_sections"] == [])
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+            return False
+        return False
     if mode == "tabs":
         import cairo
         d = tempfile.mkdtemp()

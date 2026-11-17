@@ -1181,6 +1181,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             ui = self.load_ui()
             self.nav_width = min(max(int(ui.get("nav_width", 190)), 120), 600)
             nav_open = bool(ui.get("nav_open", True))
+            self.closed_sections = set(ui.get("closed_sections", []))     # sections folded away last time
+            self.sections = {}
             self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)   # drag the bar to resize
             self.sidebar = self.build_sidebar()
             self.paned.set_start_child(self.sidebar)
@@ -1964,7 +1966,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             try:
                 config_dir().mkdir(parents=True, exist_ok=True)
                 self.ui_file().write_text(json.dumps(
-                    {"nav_width": int(self.nav_width), "nav_open": self.sidebar.get_visible()}))
+                    {"nav_width": int(self.nav_width), "nav_open": self.sidebar.get_visible(),
+                     "closed_sections": sorted(self.closed_sections)}))
             except OSError:
                 pass
 
@@ -1984,11 +1987,43 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                            margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
             side.set_size_request(110, -1)
 
-            def head(text):
-                lab = Gtk.Label(label=text, xalign=0, margin_top=10, margin_bottom=2)
+            body = [side]                                   # where the next buttons go: a section's own box
+
+            def add(widget):
+                body[0].append(widget)
+
+            def head(text, key):
+                """A section heading with a small arrow on the right that folds the section away and opens it."""
+                row = Gtk.Box(spacing=4, margin_top=10, margin_bottom=2)
+                lab = Gtk.Label(label=text, xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
                 lab.add_css_class("dim-label")
                 lab.add_css_class("caption-heading")
-                side.append(lab)
+                is_open = key not in self.closed_sections
+                arrow = Gtk.Button(icon_name="pan-down-symbolic" if is_open else "pan-end-symbolic")
+                arrow.add_css_class("flat")
+                arrow.add_css_class("inkling-fold")
+                arrow.set_tooltip_text("Fold this section away, or open it again")
+                row.append(lab)
+                row.append(arrow)
+                revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN, transition_duration=150,
+                                        reveal_child=is_open)
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                revealer.set_child(inner)
+                side.append(row)
+                side.append(revealer)
+                body[0] = inner
+                self.sections[key] = (revealer, arrow)
+
+                def toggle(*_):
+                    show = not revealer.get_reveal_child()
+                    revealer.set_reveal_child(show)
+                    arrow.set_icon_name("pan-down-symbolic" if show else "pan-end-symbolic")
+                    (self.closed_sections.discard if show else self.closed_sections.add)(key)
+                    self.save_ui()
+                arrow.connect("clicked", toggle)
+                click = Gtk.GestureClick()                  # the heading itself folds it too
+                click.connect("released", lambda *_: toggle())
+                lab.add_controller(click)
 
             def button(label, cb, tip=None, icons=()):
                 b = Gtk.Button()
@@ -1997,11 +2032,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 b.connect("clicked", cb)
                 if tip:
                     b.set_tooltip_text(tip)
-                side.append(b)
+                add(b)
 
-            head("TABS")
+            head("TABS", "tabs")
             self.tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            side.append(self.tabs_box)
+            add(self.tabs_box)
             button("+ New note", self.on_new_tab, "A blank note in its own tab")
             self.open_in = Gtk.Button()
             self.open_in.add_css_class("flat")
@@ -2013,15 +2048,16 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.open_in.set_child(open_box)
             self.open_in.connect("clicked", self.open_in_app)
             self.open_in.set_visible(False)
-            side.append(self.open_in)
+            add(self.open_in)
             self.tab_css = Gtk.CssProvider()
             self.tab_css.load_from_string(("@define-color accent_bg_color #7c3aed; @define-color accent_color #7c3aed; "
                                       ".inkling-tab-active { background: alpha(#a78bfa, 0.25); border-radius: 6px; } "
-                                      "window.inkling-win { background: #27242f; }"))
+                                      "window.inkling-win { background: #27242f; } "
+                                      "button.inkling-fold { min-width: 22px; min-height: 22px; padding: 0; }"))
             self.win.add_css_class("inkling-win")
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.tab_css,
                                                       Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-            head("OPEN (each in its own tab)")
+            head("OPEN", "open")
             button("Note…", self.on_open, "A note you saved before, to continue it", icons="inkling")
             button("PDF…", lambda *_: self.pick_file("Open a PDF", "PDF", [".pdf"], self.add_slide_file),
                    "Open a PDF: write on it, highlight, then Export", icons="application-pdf")
@@ -2032,7 +2068,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             button("Picture…", lambda *_: self.pick_file(
                 "Add a picture", "Pictures", [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"], self.add_picture_file),
                 "Adds a picture to the tab you are in", icons="image-x-generic")
-            head("PDF PAGES")
+            head("PDF PAGES", "pdf")
             button("Join another PDF…", lambda *_: self.pick_file(
                 "Add a PDF to this one", "PDF", [".pdf"], lambda p: self.add_slide_file(p, new_tab=False)),
                 "Puts another PDF next to this one in the same tab, so Export saves them as one file")
@@ -2041,7 +2077,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             button("Move page up", lambda *_: self.move_page(-1))
             button("Move page down", lambda *_: self.move_page(1))
             button("Split…", self.on_split, "Save only some pages as a new PDF")
-            head("SIGN")
+            head("SIGN", "sign")
             button("Sign", self.on_sign, "Place your signature on the page (you draw it the first time)")
             button("New signature…", self.start_signature, "Draw your signature again")
             button("Sign digitally…", self.on_sign_digitally,
@@ -2052,10 +2088,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 b.connect("clicked", cb)
                 self.sign_row.append(b)
             self.sign_row.get_first_child().add_css_class("suggested-action")
-            side.append(self.sign_row)
-            head("RECENT")
+            add(self.sign_row)
+            head("RECENT", "recent")
             self.recent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            side.append(self.recent_box)
+            add(self.recent_box)
             sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
             sc.set_min_content_width(110)
             sc.set_child(side)
