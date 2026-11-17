@@ -470,19 +470,21 @@ def convert_slides(path, progress=lambda text: None, on_page=None):
 class Item:
     """A picture or a text box. x, y, image width and text size are in world pixels
     (1 world pixel = 1 screen pixel at zoom 1)."""
-    __slots__ = ("kind", "x", "y", "width", "texture", "text", "size", "color", "png", "auto", "pdf")
+    __slots__ = ("kind", "x", "y", "width", "texture", "text", "size", "color", "png", "auto", "pdf", "sign")
 
     def __init__(self, kind, x, y, width=400.0, texture=None, text="", size=24.0,
-                 color=(0.08, 0.08, 0.08), png=None, auto=False, pdf=None):
+                 color=(0.08, 0.08, 0.08), png=None, auto=False, pdf=None, sign=None):
         self.kind, self.x, self.y = kind, x, y
         self.width, self.texture, self.text, self.size, self.color = width, texture, text, size, color
         self.png = png        # cached PNG bytes of the picture (for saving)
         self.auto = auto      # the screenshot placed automatically: doesn't count as "content"
         self.pdf = pdf        # (path of the PDF, page index) when this picture is a PDF page
+        self.sign = sign      # a signature: {"aspect": h/w, "strokes": [{"width", "pts": [[u, v, p]]}]},
+                              # points as fractions of the signature's width
 
     def clone(self):
         return Item(self.kind, self.x, self.y, self.width, self.texture, self.text, self.size,
-                    self.color, self.png, self.auto, self.pdf)
+                    self.color, self.png, self.auto, self.pdf, self.sign)
 
 
 def run_canvas(screenshot, open_name=None, slides=None, files=()):
@@ -518,6 +520,15 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.color, self.width, self.alpha, self.pts = color, width, alpha, []  # pts: (x, y, pressure)
             self.cache = None   # (point count, [(path, Gsk.Stroke)]): built once per stroke, not per frame
 
+    def sign_strokes(it):
+        """A signature item as ordinary strokes in world pixels."""
+        out = []
+        for sd in it.sign["strokes"]:
+            st = Stroke(it.color, sd["width"] * it.width)
+            st.pts = [(it.x + u * it.width, it.y + v * it.width, p) for u, v, p in sd["pts"]]
+            out.append(st)
+        return out
+
     def stroke_runs(s):
         runs = []
         for width, segs in stroke_segments(s):
@@ -542,6 +553,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             super().__init__(application_id="local.pennote.canvas" + suffix,
                              flags=Gio.ApplicationFlags.HANDLES_OPEN)   # files from "Open with"
             self.win = None
+            self.signing = None       # while drawing a new signature: what the surface held before
             self.erase_snapped = False
             self.strokes = []
             self.items = []           # pictures and text boxes
@@ -1017,6 +1029,16 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             button("Move page up", lambda *_: self.move_page(-1))
             button("Move page down", lambda *_: self.move_page(1))
             button("Split…", self.on_split, "Save only some pages as a new PDF")
+            head("SIGN")
+            button("Sign", self.on_sign, "Place your signature on the page (you draw it the first time)")
+            button("New signature…", self.start_signature, "Draw your signature again")
+            self.sign_row = Gtk.Box(spacing=6, visible=False)
+            for label, cb in (("Done", self.finish_signature), ("Cancel", self.cancel_signature)):
+                b = Gtk.Button(label=label)
+                b.connect("clicked", cb)
+                self.sign_row.append(b)
+            self.sign_row.get_first_child().add_css_class("suggested-action")
+            side.append(self.sign_row)
             head("RECENT")
             self.recent_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             side.append(self.recent_box)
@@ -1195,13 +1217,15 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         def item_box(self, item):
             """(x, y, width, height) of an item in world pixels."""
+            if item.kind == "sign":
+                return item.x, item.y, item.width, item.width * item.sign["aspect"]
             if item.kind == "image":
                 tw, th = item.texture.get_width(), item.texture.get_height()
                 return item.x, item.y, item.width, item.width * th / tw
             pw, ph = self.make_layout(item).get_pixel_size()
             return item.x, item.y, max(pw, 8), max(ph, 8)
 
-        def hit_item(self, cx, cy, kinds=("text", "image")):
+        def hit_item(self, cx, cy, kinds=("text", "sign", "image")):
             pad = 4 / self.zoom
             for kind in kinds:                       # text is drawn above pictures
                 for it in reversed(self.items):
@@ -1347,7 +1371,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.grab_snapped = True
             if kind == "move":
                 it.x, it.y = cx - a, cy - b
-            elif it.kind == "image":
+            elif it.kind in ("image", "sign"):
                 it.width = max(cx - it.x, 12.0)
             else:  # resize text: scale the font by how far the corner moved
                 ratio = max(cx - it.x, 8) / max(a, 1)
@@ -1425,6 +1449,14 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     s.cache = (len(s.pts), stroke_runs(s))
                 for path, stroke in s.cache[1]:
                     snapshot.append_stroke(path, stroke, rgba)
+            for it in self.items:                                  # signatures, inked like the pen
+                if it.kind == "sign":
+                    rgba = Gdk.RGBA()
+                    rgba.red, rgba.green, rgba.blue = it.color
+                    rgba.alpha = 1.0
+                    for st in sign_strokes(it):
+                        for path, stroke in stroke_runs(st):
+                            snapshot.append_stroke(path, stroke, rgba)
             for it in self.items:                                  # text, above the pen
                 if it.kind == "text":
                     rgba = Gdk.RGBA()
@@ -1529,9 +1561,16 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 marks.append(st)
             self.strokes = marks
             for it in self.items:
-                f = rule_for(it.x, it.y) if it.kind == "text" else None
-                if f:
-                    it.x, it.y = f(it.x, it.y)
+                if it.kind == "text":
+                    f = rule_for(it.x, it.y)
+                    if f:
+                        it.x, it.y = f(it.x, it.y)
+                elif it.kind == "sign":                      # a signature follows by its centre
+                    cx, cy = self.item_centre(it)
+                    f = rule_for(cx, cy)
+                    if f:
+                        nx, ny = f(cx, cy)
+                        it.x, it.y = it.x + nx - cx, it.y + ny - cy
 
         def delete_page(self, *_):
             it = self.target_page()
@@ -1544,7 +1583,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return x <= px <= x + w and y <= py <= y + h
             self.strokes = [st for st in self.strokes if not inside(*stroke_centre(st))]
             self.items = [i for i in self.items
-                          if i is not it and not (i.kind == "text" and inside(i.x, i.y))]
+                          if i is not it and not (i.kind == "text" and inside(i.x, i.y))
+                          and not (i.kind == "sign" and inside(*self.item_centre(i)))]
             below = [p for p in self.pdf_pages() if abs(p.x - it.x) < 1 and p.y > it.y]
             if below:                                        # pull the pages underneath up
                 dy = it.y - below[0].y
@@ -1601,6 +1641,79 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             it.texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(png))
             it.png, it.pdf, it.width = png, (str(new), idx), h
             self.status.set_text("Page turned. Undo turns it back.")
+            self.area.queue_draw()
+
+        # ---- signing: draw it once, place it on any page ------------------------
+        def sign_file(self):
+            return Path(os.environ.get("PEN_NOTE_CONFIG") or Path.home() / ".config" / "pen-note") / "signature.json"
+
+        def on_sign(self, *_):
+            try:
+                sig = json.loads(self.sign_file().read_text())
+            except (OSError, ValueError):
+                sig = None
+            if sig:
+                self.place_signature(sig)
+            else:
+                self.start_signature()
+
+        def start_signature(self, *_):
+            self.cancel_signature()                          # starting again drops a drawing in progress
+            self.signing = {"strokes": list(self.strokes), "undo": list(self.undo_stack),
+                            "redo": list(self.redo_stack), "dirty": self.dirty}
+            self.set_mode("pen")
+            self.sign_row.set_visible(True)
+            self.status.set_text("Draw your signature anywhere, then click Done. It is saved, so you only do this once.")
+
+        def cancel_signature(self, *_):
+            """Leave signature drawing and put the surface back as it was."""
+            if self.signing is None:
+                return
+            before, self.signing = self.signing, None
+            self.strokes, self.undo_stack, self.redo_stack = before["strokes"], before["undo"], before["redo"]
+            self.dirty = before["dirty"]
+            self.sign_row.set_visible(False)
+            self.status.set_text("")
+            self.area.queue_draw()
+
+        def finish_signature(self, *_):
+            if self.signing is None:
+                return
+            known = {id(st) for st in self.signing["strokes"]}
+            mine = [st for st in self.strokes if id(st) not in known]
+            if not mine:
+                self.status.set_text("Draw your signature first, then click Done.")
+                return
+            half = max(st.width for st in mine) / 2
+            x0 = min(p[0] for st in mine for p in st.pts) - half
+            y0 = min(p[1] for st in mine for p in st.pts) - half
+            x1 = max(p[0] for st in mine for p in st.pts) + half
+            y1 = max(p[1] for st in mine for p in st.pts) + half
+            bw = max(x1 - x0, 1.0)
+            sig = {"aspect": max(y1 - y0, 1.0) / bw,
+                   "strokes": [{"width": st.width / bw,
+                                "pts": [[(px - x0) / bw, (py - y0) / bw, pr] for px, py, pr in st.pts]}
+                               for st in mine]}
+            self.cancel_signature()                          # the drawing becomes a signature, not strokes
+            try:
+                self.sign_file().parent.mkdir(parents=True, exist_ok=True)
+                self.sign_file().write_text(json.dumps(sig))
+            except OSError as e:
+                log("could not save the signature:", e)
+            self.place_signature(sig)
+
+        def place_signature(self, sig):
+            w, h = self.canvas_size()
+            width = 220 / self.zoom
+            cx, cy = self.to_world(w / 2, h / 2)
+            self.push_undo()
+            it = Item("sign", cx - width / 2, cy - width * sig["aspect"] / 2, width=width,
+                      color=self.color, sign=sig)
+            self.items.append(it)
+            self.set_mode("move")
+            self.selected = it
+            self.status.set_text("Signature placed: drag it into position, drag the corner square to resize. "
+                                 "Pick a colour to go back to drawing.")
             self.area.queue_draw()
 
         def on_split(self, *_):
@@ -1661,10 +1774,18 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.status.set_text(f"PDF failed: {e}")
             dlg.save(self.win, None, done)
 
+        def all_strokes(self):
+            """Pen strokes plus the strokes of every signature."""
+            return self.strokes + [st for it in self.items if it.kind == "sign" for st in sign_strokes(it)]
+
+        def item_centre(self, it):
+            x, y, w, h = self.item_box(it)
+            return x + w / 2, y + h / 2
+
         def marks_in(self, rect):
             """True if any stroke or text sits on the rectangle (so a PDF page needs an overlay)."""
             x, y, w, h = rect
-            for st in self.strokes:
+            for st in self.all_strokes():
                 xs, ys = [p[0] for p in st.pts], [p[1] for p in st.pts]
                 if min(xs) <= x + w and max(xs) >= x and min(ys) <= y + h and max(ys) >= y:
                     return True
@@ -1696,7 +1817,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         ctx.restore()
             ctx.set_line_cap(cairo.LINE_CAP_ROUND)
             ctx.set_line_join(cairo.LINE_JOIN_ROUND)
-            for st in self.strokes:
+            for st in self.all_strokes():
                 ctx.set_source_rgba(*st.color, st.alpha)
                 for width, segs in stroke_segments(st):
                     ctx.set_line_width(width)
@@ -1789,6 +1910,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 for n, it in enumerate(self.items):
                     d = {"kind": it.kind, "x": it.x, "y": it.y, "width": it.width,
                          "text": it.text, "size": it.size, "color": list(it.color), "auto": it.auto}
+                    if it.sign:
+                        d["sign"] = it.sign
                     if it.pdf:                          # the original PDF travels with the note
                         name = pdf_member(it.pdf[0])
                         if name not in zf.namelist():
@@ -1818,7 +1941,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 items = []
                 for d in state["items"]:
                     it = Item(d["kind"], d["x"], d["y"], width=d["width"], text=d["text"],
-                              size=d["size"], color=tuple(d["color"]), auto=d.get("auto", False))
+                              size=d["size"], color=tuple(d["color"]), auto=d.get("auto", False),
+                              sign=d.get("sign"))
                     if "pdf" in d:
                         PDF_STORE.mkdir(parents=True, exist_ok=True)
                         out = PDF_STORE / Path(d["pdf"]["file"]).name

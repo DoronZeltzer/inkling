@@ -318,6 +318,42 @@ def run(self):
             log("selftest pdf split: one page:", len(PdfReader(part).pages) == 1,
                 "| it is page 2:", "Page 2" in (PdfReader(part).pages[0].extract_text() or ""))
 
+            # signing: draw once (saved), place it on page 2, it shows up in the PDF
+            os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"               # never touch the real saved signature
+            self.color = (0.08, 0.08, 0.08)
+            n_strokes, n_undo = len(self.strokes), len(self.undo_stack)
+            self.start_signature()
+            self.begin(300, 300, 0.5, False)
+            self.extend(340, 340, 0.6)
+            self.extend(380, 300, 0.5)
+            self.extend(420, 340, 0.5)
+            self.finish()
+            self.finish_signature()
+            signs = [i for i in self.items if i.kind == "sign"]
+            log("selftest sign: placed one signature and saved it:", len(signs) == 1 and self.sign_file().exists(),
+                "| drawing left no strokes behind:", len(self.strokes) == n_strokes,
+                "| selected, in the move tool:", self.selected is signs[0] and self.mode == "move")
+            self.on_sign()                                           # second time: uses the saved one, no drawing
+            signs = [i for i in self.items if i.kind == "sign"]
+            log("selftest sign: second signature comes from the saved one:", len(signs) == 2)
+            self.on_undo()
+            signs = [i for i in self.items if i.kind == "sign"]
+            sign = signs[0]
+            page2 = self.pdf_pages()[1]
+            bx, by, bw, bh = self.item_box(page2)
+            sign.x, sign.y, sign.width = bx + 0.3 * bw, by + 0.65 * bh, 0.3 * bw      # drag it onto page 2
+            dark = lambda r_, g, b: r_ < 100 and g < 100 and b < 100
+            _, _, before = pixels(out, 2)
+            signed = f"{d}/signed.pdf"
+            self.export_pdf(signed)
+            w, h, after = pixels(signed, 2)
+            low = lambda data: sum(1 for i in range(0, len(data) - 2, 3)
+                                   if (i // 3) // w / h > 0.55 and dark(data[i], data[i + 1], data[i + 2]))
+            log("selftest sign export: ink appears where it was placed:", low(before) == 0 and low(after) > 5)
+            self.on_undo()                                           # back to no signature
+            log("selftest sign undo: signature gone:", not [i for i in self.items if i.kind == "sign"])
+            self.on_redo()
+
             # the note keeps its PDF: save, forget everything, reopen, export again
             self.name_entry.set_text("pdf note")
             ok = self.save()
@@ -329,6 +365,7 @@ def run(self):
             self.export_pdf(again)
             log("selftest pdf reopen: still 2 pages and exports:", len(self.pdf_pages()) == 2
                 and len(PdfReader(again).pages) == 2)
+            log("selftest sign reopen: signature came back:", len([i for i in self.items if i.kind == "sign"]) == 1)
 
             # no PDF at all: the whole surface becomes one page
             self.strokes, self.items = [], []
