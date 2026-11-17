@@ -378,54 +378,144 @@ def run(self):
             return False
         GLib.timeout_add(500, first)
         return False
+    if mode == "apps":
+        import inkling as app_module
+        from inkling import OFFICE_APPS, find_appimage, find_office_tool, office_available, office_to_pdf
+        d = tempfile.mkdtemp()
+        tools = {}
+        for name, (label, _exts) in OFFICE_APPS.items():
+            tool = find_office_tool(name) if office_available(name) else None
+            tools[name] = tool
+            ver = subprocess.run([str(tool), "--version"], capture_output=True, text=True).returncode == 0 if tool else None
+            log(f"selftest apps: {label}", "found at", find_appimage(name), "| its tool runs:", ver if tool else "n/a (not installed)")
+        need = [n for n, t_ in tools.items() if t_ is None]
+        if need:
+            log("selftest apps: skipping the file checks, not installed:", need)
+            self.win.close()
+            return False
+        wc, dc, gc = tools["wordcraft"], tools["deckcraft"], tools["gridcraft"]
+        (Path(d) / "t.html").write_text("<html><body><h1>Quarterly report</h1><p>The numbers went up.</p>"
+                                        "<p dir='rtl'>שלום עולם</p></body></html>")
+        subprocess.run([str(wc), "convert", f"{d}/t.html", f"{d}/report.docx"], capture_output=True, check=True)
+        subprocess.run([str(dc), "run", "--cmd", 'slide.new={"layout":"title","title":"Deck title","body":"deck body"}',
+                        "--save", f"{d}/deck.pptx"], capture_output=True, check=True)
+        (Path(d) / "s.csv").write_text("Name,Qty\nApple,3\nPear,5\n")
+        subprocess.run([str(gc), "convert", f"{d}/s.csv", f"{d}/sheet.xlsx"], capture_output=True, check=True)
+        files = [(f"{d}/report.docx", "WordCraft", "Quarterly report"), (f"{d}/deck.pptx", "DeckCraft", "Deck title"),
+                 (f"{d}/sheet.xlsx", "GridCraft", "Apple"), (f"{d}/s.csv", "GridCraft", "Pear")]
+        todo = list(files)
+
+        def next_file():
+            if not todo:
+                finish()
+                return
+            path, who, word = todo.pop(0)
+
+            def opened():
+                pages = [i for i in self.items if i.kind == "image" and i.pdf]
+                text = " ".join(t_ for p in pages for t_ in [x[0] for x in app_module.pdf_text_lines(p.pdf[0], p.pdf[1] + 1)[2]])
+                log(f"selftest apps: {Path(path).name} opened by {who} in its own tab:", len(pages) >= 1 and word in text
+                    and who in self.status.get_text() and self.cur.source == path,
+                    "| pages:", len(pages))
+                if path.endswith(".docx"):
+                    log("selftest apps: 'Open in WordCraft' is offered for it:", self.open_in.get_visible()
+                        and "WordCraft" in self.open_in.get_label(), "| Hebrew arrived:", "שלום" in text)
+                next_file()
+            self.add_slide_file(path, done=opened)
+
+        def finish():
+            log("selftest apps: four files, four tabs:", len(self.docs) == 4)
+            # an app that is not on this computer: say which one and what to do
+            OFFICE_APPS["fakecraft"] = ("FakeCraft", {".fake"})
+            (Path(d) / "x.fake").write_text("x")
+            try:
+                office_to_pdf(Path(d) / "x.fake", Path(d) / "x.pdf")
+                said = ""
+            except RuntimeError as e:
+                said = str(e)
+            del OFFICE_APPS["fakecraft"]
+            log("selftest apps: a missing app is named, with what to do:", "FakeCraft" in said and "AppImage" in said or
+                bool(app_module.libreoffice_path()))
+            if not app_module.libreoffice_path():
+                try:
+                    office_to_pdf(Path(d) / "x.odp", Path(d) / "x.pdf")
+                    said = ""
+                except RuntimeError as e:
+                    said = str(e)
+                log("selftest apps: a format none of them reads says so:", "no app" in said and ".odp" in said)
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+        next_file()
+        return False
     if mode == "export":
         import cairo
-        import zipfile
+        from inkling import find_office_tool
         d = tempfile.mkdtemp()
         src = f"{d}/doc.pdf"
         surf = cairo.PDFSurface(src, 595, 842)
         c = cairo.Context(surf)
-        for n in (1, 2):
-            c.set_font_size(40)
-            c.move_to(80, 200)
-            c.show_text(f"Export page {n}")
-            surf.show_page()
+        c.set_font_size(40)
+        c.move_to(80, 100)
+        c.show_text("Export page 1")
+        c.set_font_size(12)
+        for k, ln in enumerate(("alpha beta gamma", "delta epsilon zeta", "eta theta iota")):
+            c.move_to(80, 150 + 16 * k)
+            c.show_text(ln)
+        surf.show_page()
+        c.set_font_size(40)
+        c.move_to(80, 100)
+        c.show_text("Export page 2")
+        c.set_source_rgb(0.1, 0.3, 0.85)
+        c.rectangle(80, 200, 200, 100)
+        c.fill()
+        surf.show_page()
         surf.finish()
-        out = {fmt: Path(d) / f"out.{fmt}" for fmt in ("docx", "pptx", "odt", "odp", "txt")}
-        out["png"] = Path(d) / "pics"
+        fmts = ["docx-pages", "docx", "pptx", "odt", "rtf", "txt", "png"]
+        out = {"docx-pages": Path(d) / "pages.docx", "docx": Path(d) / "text.docx", "pptx": Path(d) / "out.pptx",
+               "odt": Path(d) / "out.odt", "rtf": Path(d) / "out.rtf", "txt": Path(d) / "out.txt", "png": Path(d) / "pics"}
         out["png"].mkdir()
-        todo = ["docx", "pptx", "odt", "odp", "txt", "png"]
         results = {}
 
         def next_one(err=None, msg=""):
             if results or err or msg:
-                results[todo[len(results)]] = (err, msg)
-            if len(results) < len(todo):
-                fmt = todo[len(results)]
+                results[fmts[len(results)]] = (err, msg)
+            if len(results) < len(fmts):
+                fmt = fmts[len(results)]
                 self.run_export(fmt, out[fmt], "doc", done=next_one)
                 return
-            log("selftest export (errors, if any):", {k: v[0] for k, v in results.items() if v[0]})
-            if not (shutil.which("libreoffice") or shutil.which("soffice")):
-                said = all("LibreOffice" in (results[f][0] or "") and "sudo snap install" in results[f][0]
-                           for f in ("docx", "pptx", "odt", "odp"))
-                log("selftest export: LibreOffice is missing, so Word/PowerPoint/OpenDocument say how to get it:", said,
-                    "| plain text:", results["txt"][0] is None and "Export page 2" in out["txt"].read_text(),
-                    "| pictures (one per page):", results["png"][0] is None and len(list(out["png"].glob("doc-*.png"))) == 2)
-                shutil.rmtree(d, ignore_errors=True)
-                self.win.close()
-                return
             ok = lambda f: results[f][0] is None
-            log("selftest export: Word:", ok("docx") and "Export page 1" in zipfile.ZipFile(out["docx"]).read("word/document.xml").decode()
-                and "Export page 2" in zipfile.ZipFile(out["docx"]).read("word/document.xml").decode(),
-                "| PowerPoint (2 slides, with the text):", ok("pptx") and len([n for n in zipfile.ZipFile(out["pptx"]).namelist()
-                if n.startswith("ppt/slides/slide") and n.endswith(".xml")]) == 2)
-            log("selftest export: OpenDocument text:", ok("odt") and "Export page 1" in zipfile.ZipFile(out["odt"]).read("content.xml").decode(),
-                "| OpenDocument slides:", ok("odp") and zipfile.ZipFile(out["odp"]).read("content.xml").decode().count("<draw:page ") == 2,
-                "| plain text:", ok("txt") and "Export page 2" in out["txt"].read_text(),
+            log("selftest export (errors, if any):", {k: v[0] for k, v in results.items() if v[0]})
+            wc, dc = find_office_tool("wordcraft"), find_office_tool("deckcraft")
+            if wc and dc:
+                def text_of(p):
+                    return subprocess.run([str(wc), "text", str(p)], capture_output=True, text=True).stdout
+                back = Path(d) / "back.pdf"
+                subprocess.run([str(wc), "convert", str(out["docx-pages"]), str(back)], capture_output=True)
+                pics = len(subprocess.run(["pdfimages", "-list", str(back)], capture_output=True, text=True).stdout.strip().splitlines()) - 2
+                log("selftest export: Word, pages as pictures (2 pages, 2 pictures):", ok("docx-pages") and pics == 2
+                    and len(PdfReader(str(back)).pages) == 2)
+                t = text_of(out["docx"])
+                log("selftest export: Word, editable text (heading, paragraph kept whole, both pages):",
+                    ok("docx") and "Export page 1" in t and "alpha beta gamma delta epsilon zeta eta theta iota" in t
+                    and "Export page 2" in t)
+                info = json.loads(subprocess.run([str(dc), "info", str(out["pptx"])], capture_output=True, text=True).stdout)
+                log("selftest export: PowerPoint (2 slides, the page size):", ok("pptx") and len(info.get("slides", [])) == 2)
+                log("selftest export: OpenDocument text:", ok("odt") and "Export page 1" in text_of(out["odt"]),
+                    "| rich text:", ok("rtf") and "Export page 2" in text_of(out["rtf"]))
+            else:
+                log("selftest export: WordCraft or DeckCraft not installed, the format entries stay greyed out:",
+                    not export_available_check())
+            log("selftest export: plain text:", ok("txt") and "Export page 2" in out["txt"].read_text(),
                 "| pictures (one per page):", ok("png") and len(list(out["png"].glob("doc-*.png"))) == 2)
             log("selftest export: no temporary files left behind:", not list(PDF_STORE.glob("prot-export-*.pdf")))
             shutil.rmtree(d, ignore_errors=True)
             self.win.close()
+
+        def export_available_check():
+            from inkling import export_available
+            return any(export_available(f) for f in ("docx", "pptx"))
+
+        from pypdf import PdfReader
 
         def opened():
             next_one()

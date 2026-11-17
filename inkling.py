@@ -234,8 +234,10 @@ EXPORT_MAX_PIXELS = 60_000_000   # total pixels of the saved PNG
 EXPORT_SCALE = 3.0          # saved PNG pixels per world pixel, reduced if that exceeds the limits
 
 # --- slides (PowerPoint, OpenDocument, PDF) ----------------------------------
-# Everything opened this way becomes PDF pages: slides, Word, Excel and OpenDocument files via LibreOffice
-OFFICE_EXTS = {".pptx", ".ppt", ".pps", ".ppsx", ".odp", ".docx", ".doc", ".odt", ".rtf", ".xlsx", ".xls", ".ods"}
+# Everything opened this way becomes PDF pages. Which app does the converting is found out when you open
+# the file (see OFFICE_APPS): the office apps on this computer, or LibreOffice if it is installed.
+OFFICE_EXTS = {".docx", ".doc", ".odt", ".rtf", ".pptx", ".ppsx", ".deckcraft", ".xlsx", ".csv", ".tsv",
+               ".ppt", ".pps", ".odp", ".xls", ".ods"}
 SLIDE_EXTS = OFFICE_EXTS | {".pdf"}
 SLIDE_RENDER_WIDTH = 1400   # pixels per slide picture
 SLIDE_DISPLAY_WIDTH = 900   # world pixels per slide on the surface
@@ -574,6 +576,143 @@ def safe_name(name):
 # One conversion at a time: two LibreOffice runs on the same profile collide and the second fails.
 _convert_lock = threading.Lock()
 
+# ---- the office apps on this computer: found by themselves, each used for what it does ---------------------
+# name -> (what it is called, the file endings it opens). Each app has a command-line tool, "<name>-cli",
+# that converts files without a window; it is found on the PATH, or taken once out of the app's AppImage.
+OFFICE_APPS = {
+    "wordcraft": ("WordCraft", {".docx", ".doc", ".odt", ".rtf"}),
+    "deckcraft": ("DeckCraft", {".pptx", ".ppsx", ".deckcraft"}),
+    "gridcraft": ("GridCraft", {".xlsx", ".csv", ".tsv"}),
+}
+TOOL_CACHE = Path.home() / ".cache" / "inkling" / "tools"
+_tool_lock = threading.Lock()
+OPENED_WITH = {}      # file -> the app that opened it, for the message when it is ready
+
+
+def office_app_for(ext):
+    return next((n for n, (_label, exts) in OFFICE_APPS.items() if ext in exts), None)
+
+
+def libreoffice_path():
+    return shutil.which("libreoffice") or shutil.which("soffice")
+
+
+def find_appimage(name):
+    """An app's AppImage wherever it lives: the usual folders, or the one a desktop entry starts."""
+    home, found = Path.home(), []
+    for d in (home / "Applications", home / ".local" / "bin", home / "bin", home / "Downloads", home / "Desktop", Path("/opt")):
+        try:
+            found += [p for p in d.glob("*.AppImage") if name in p.name.lower()]
+        except OSError:
+            pass
+    for d in (home / ".local" / "share" / "applications", Path("/usr/share/applications"),
+              Path("/var/lib/snapd/desktop/applications")):
+        try:
+            entries = list(d.glob("*.desktop"))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                text = entry.read_text(errors="ignore")
+            except OSError:
+                continue
+            m = re.search(r"^Exec=(\"[^\"]+\"|\S+)", text, re.M)
+            if m and (name in entry.name.lower() or name in text.lower()):
+                exe = Path(m.group(1).strip('"'))
+                if exe.name.lower().endswith(".appimage"):
+                    found.append(exe)
+    found = [p for p in found if p.is_file() and os.access(p, os.X_OK)]
+    return max(found, key=lambda p: p.stat().st_mtime, default=None)
+
+
+def office_available(name):
+    cli = f"{name}-cli"
+    return bool(shutil.which(cli)) or (TOOL_CACHE / name / cli).exists() or find_appimage(name) is not None
+
+
+def find_office_tool(name):
+    """The command-line tool of an office app, or None if the app isn't on this computer. From an AppImage
+    it is taken out once (a second or two) and kept, and taken out again if the app is updated."""
+    cli = f"{name}-cli"
+    on_path = shutil.which(cli)
+    if on_path:
+        return Path(on_path)
+    image = find_appimage(name)
+    if image is None:
+        return None
+    info = image.stat()
+    stamp = f"{image}|{info.st_mtime_ns}|{info.st_size}"
+    home = TOOL_CACHE / name
+    tool, mark = home / cli, home / "from.txt"
+    with _tool_lock:
+        if tool.exists() and mark.exists() and mark.read_text() == stamp:
+            return tool
+        try:
+            TOOL_CACHE.mkdir(parents=True, exist_ok=True)
+            work = Path(tempfile.mkdtemp(prefix=f"{name}-", dir=TOOL_CACHE))
+            try:
+                subprocess.run([str(image), "--appimage-extract", f"usr/bin/{cli}"], cwd=work,
+                               capture_output=True, timeout=180, check=True)
+                got = work / "squashfs-root" / "usr" / "bin" / cli
+                if not got.exists():
+                    return None
+                home.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(got), str(tool))
+                os.chmod(tool, 0o755)
+                mark.write_text(stamp)
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+            return tool
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+
+def libreoffice_to_pdf(path, out_pdf):
+    office = libreoffice_path()
+    WORK_DIR.mkdir(exist_ok=True)
+    job = Path(tempfile.mkdtemp(prefix="lo-", dir=WORK_DIR))        # the snap version only reads folders in your home
+    try:
+        src = job / f"in{path.suffix}"
+        shutil.copyfile(path, src)
+        r = subprocess.run([office, f"-env:UserInstallation={(WORK_DIR / 'lo-profile').as_uri()}", "--headless",
+                            "--convert-to", "pdf", "--outdir", str(job), str(src)],
+                           capture_output=True, text=True, timeout=300)
+        made = job / "in.pdf"
+        if not made.exists():
+            raise RuntimeError("LibreOffice could not convert it" + (f": {(r.stdout + r.stderr).strip()[-160:]}"
+                                                                    if (r.stdout + r.stderr).strip() else ""))
+        shutil.move(str(made), str(out_pdf))
+    finally:
+        shutil.rmtree(job, ignore_errors=True)
+
+
+def office_to_pdf(path, out_pdf, progress=lambda text: None):
+    """Turn a Word, slides or spreadsheet file into a PDF with the app on this computer that opens that kind
+    of file. Returns the name of the app used. Raises RuntimeError saying what to do if none can."""
+    path, out_pdf = Path(path), Path(out_pdf)
+    ext = path.suffix.lower()
+    name = office_app_for(ext)
+    why = ""
+    if name:
+        label = OFFICE_APPS[name][0]
+        tool = find_office_tool(name)
+        if tool is not None:
+            progress(f"Converting with {label}…")
+            r = subprocess.run([str(tool), "convert", str(path), str(out_pdf)], capture_output=True, text=True, timeout=300)
+            if r.returncode == 0 and out_pdf.exists() and out_pdf.stat().st_size > 0:
+                return label
+            why = f"{label} could not convert it: {(r.stderr or r.stdout).strip()[-160:]}"
+        else:
+            why = f"{label} opens {ext} files, but I can't find it (put its AppImage in ~/Applications)"
+    if libreoffice_path():
+        progress("Converting with LibreOffice…")
+        libreoffice_to_pdf(path, out_pdf)
+        return "LibreOffice"
+    if not why:
+        why = (f"no app on this computer opens {ext} files (WordCraft opens Word files, DeckCraft PowerPoint, "
+               f"GridCraft spreadsheets); save it as .docx, .pptx or .xlsx, or as a PDF")
+    raise RuntimeError(why)
+
 
 def file_sha1(path):
     h = hashlib.sha1()
@@ -586,8 +725,8 @@ def file_sha1(path):
 def convert_slides(path, progress=lambda text: None, on_page=None, password=None):
     """Turn a PowerPoint/OpenDocument/PDF file into PDF pages that can be laid out.
 
-    A PDF is used as it is; PowerPoint is slow (LibreOffice needs most of a minute for a big deck), so
-    call this off the UI thread. `progress(text)` reports what it is doing and
+    A PDF is used as it is; other files are converted by the office app that opens them (found
+    automatically), which can take a while, so call this off the UI thread. `progress(text)` reports what it is doing and
     `on_page(number, total, ratio, pdf_path)` is called for each page, in order (ratio = height / width).
     The pages themselves are drawn later, as they come into view. A file that was converted before
     comes straight from the store. A password-protected PDF needs `password` (PasswordNeeded otherwise);
@@ -637,22 +776,8 @@ def convert_slides(path, progress=lambda text: None, on_page=None, password=None
                 if ext == ".pdf":
                     pdf = src
                 else:
-                    office = shutil.which("libreoffice") or shutil.which("soffice")
-                    if not office:
-                        raise RuntimeError("Word, PowerPoint, Excel and OpenDocument files need LibreOffice, which isn't "
-                                           "installed. Install it with: sudo snap install libreoffice, or save the file "
-                                           "as a PDF and open that")
-                    progress("Converting with LibreOffice… a big deck can take a minute (a PDF is much faster)")
-                    profile = WORK_DIR / "lo-profile"   # own profile: works even while LibreOffice is open
-                    r = subprocess.run(
-                        [office, f"-env:UserInstallation={profile.as_uri()}", "--headless",
-                         "--convert-to", "pdf", "--outdir", str(job), str(src)],
-                        capture_output=True, text=True, timeout=300)
                     pdf = job / "deck.pdf"
-                    if not pdf.exists():
-                        detail = (r.stdout + r.stderr).strip()[-160:]
-                        raise RuntimeError("LibreOffice could not convert it" + (f": {detail}" if detail else
-                                           " (it returned nothing; is another LibreOffice job running?)"))
+                    OPENED_WITH[str(path)] = office_to_pdf(src, pdf, progress)
                 tmp = pdf_store.with_suffix(".tmp")
                 shutil.copyfile(pdf, tmp)
                 os.replace(tmp, pdf_store)
@@ -701,21 +826,126 @@ class Doc:
         self.pending, self.deck_state = {}, {}
 
 
-EXPORT_FORMATS = (("pdf", "PDF"), ("docx", "Word (.docx)"), ("pptx", "PowerPoint (.pptx)"),
-                  ("odt", "OpenDocument text (.odt)"), ("odp", "OpenDocument slides (.odp)"),
+EXPORT_FORMATS = (("pdf", "PDF"),
+                  ("docx-pages", "Word (.docx), pages as pictures"), ("docx", "Word (.docx), editable text"),
+                  ("pptx", "PowerPoint (.pptx), pages as slides"),
+                  ("odt", "OpenDocument text (.odt)"), ("rtf", "Rich text (.rtf)"),
                   ("txt", "Plain text (.txt)"), ("png", "Pictures (.png, one per page)"))
-OFFICE_FILTERS = {"docx": ("writer_pdf_import", "docx:MS Word 2007 XML"), "pptx": ("impress_pdf_import", "pptx"),
-                  "odt": ("writer_pdf_import", "odt"), "odp": ("impress_pdf_import", "odp")}
+# format -> (file ending, the office app that writes it; None = Inkling does it itself)
+EXPORT_INFO = {"pdf": ("pdf", None), "docx-pages": ("docx", "wordcraft"), "docx": ("docx", "wordcraft"),
+               "pptx": ("pptx", "deckcraft"), "odt": ("odt", "wordcraft"), "rtf": ("rtf", "wordcraft"),
+               "txt": ("txt", None), "png": ("png", None)}
+# what LibreOffice can write from a PDF, if it is installed (the editable kinds only)
+LO_EXPORT = {"docx": ("writer_pdf_import", "docx:MS Word 2007 XML"), "pptx": ("impress_pdf_import", "pptx"),
+             "odt": ("writer_pdf_import", "odt")}
 
 
-def convert_pdf_to_office(pdf, out, fmt):
-    """Turn a PDF into a Word, PowerPoint or OpenDocument file with LibreOffice (slow: call off the UI thread).
-    The layout and text are kept; Word may split long text into boxes. Raises RuntimeError."""
-    office = shutil.which("libreoffice") or shutil.which("soffice")
-    if not office:
-        raise RuntimeError("Word, PowerPoint and OpenDocument export needs LibreOffice, which isn't installed. "
-                           "Install it with: sudo snap install libreoffice   (PDF, text and pictures work without it)")
-    infilter, target = OFFICE_FILTERS[fmt]
+def export_available(fmt):
+    app = EXPORT_INFO[fmt][1]
+    return app is None or office_available(app) or (fmt in LO_EXPORT and libreoffice_path() is not None)
+
+
+def export_hint(fmt):
+    app = EXPORT_INFO[fmt][1]
+    return f"Needs {OFFICE_APPS[app][0]} (or LibreOffice) on this computer" if app else ""
+
+
+def page_sizes(pdf):
+    """[(width, height)] in points of every page of a PDF, as a viewer shows it."""
+    from pypdf import PdfReader
+    sizes = []
+    for page in PdfReader(str(pdf)).pages:
+        w, h = float(page.cropbox.width), float(page.cropbox.height)
+        sizes.append((h, w) if page.rotation % 180 else (w, h))
+    return sizes
+
+
+def pdf_to_html(pdf, pngs, pictures):
+    """The pages as HTML for the word processor: every page one picture (looks identical), or the text in
+    reading order as headings and paragraphs (editable; a page with no text stays a picture)."""
+    sizes = page_sizes(pdf)
+    pages = [] if pictures else [pdf_text_lines(pdf, i + 1)[2] for i in range(len(sizes))]
+    heights = sorted(y1 - y0 for lines in pages for _t, _x0, y0, _x1, y1 in lines)
+    median = heights[len(heights) // 2] if heights else 12.0
+    out = ["<html><head><meta charset='utf-8'></head><body>"]
+    for i, png in enumerate(pngs):
+        pending = ' style="page-break-before:always"' if i else ""
+        lines = pages[i] if pages else []
+        if pictures or not lines:
+            out.append(f'<p{pending}><img src="{png.name}" style="width:468pt"></p>')
+            continue
+        blocks, para, prev = [], [], None
+        for text, x0, y0, _x1, y1 in lines:
+            h = y1 - y0
+            if h >= 1.3 * median:                                   # a heading: bigger than the usual line
+                if para:
+                    blocks.append(("p", " ".join(para)))
+                    para = []
+                blocks.append(("h1" if h >= 2 * median else "h2" if h >= 1.6 * median else "h3", text))
+                prev = None
+                continue
+            if prev is not None and y0 - prev[1] < 0.8 * median and abs(x0 - prev[0]) < 3 * median:
+                para.append(text)                                   # the next line of the same paragraph
+            else:
+                if para:
+                    blocks.append(("p", " ".join(para)))
+                para = [text]
+            prev = (x0, y1)
+        if para:
+            blocks.append(("p", " ".join(para)))
+        for tag, text in blocks:
+            direction = ' dir="rtl"' if is_rtl(text) else ""
+            out.append(f"<{tag}{pending}{direction}>{html.escape(text)}</{tag}>")
+            pending = ""
+    out.append("</body></html>")
+    return "\n".join(out)
+
+
+def export_office(fmt, pdf, out):
+    """Write a PDF as Word, OpenDocument, RTF or PowerPoint with the office app that does that (WordCraft for
+    documents, DeckCraft for slides). Returns the name of the app used. Raises RuntimeError."""
+    app = EXPORT_INFO[fmt][1]
+    label = OFFICE_APPS[app][0]
+    tool = find_office_tool(app)
+    if tool is None:
+        if fmt in LO_EXPORT and libreoffice_path():
+            convert_pdf_to_office_lo(pdf, out, fmt)
+            return "LibreOffice"
+        raise RuntimeError(f"{label} writes this format, but I can't find it (put its AppImage in ~/Applications, "
+                           "or install LibreOffice)")
+    WORK_DIR.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="export-", dir=WORK_DIR) as tmp:
+        d = Path(tmp)
+        subprocess.run(["pdftoppm", "-png", "-r", "110", str(pdf), str(d / "p")], capture_output=True, check=True, timeout=600)
+        pngs = sorted(d.glob("p-*.png"))
+        if fmt == "pptx":                                           # one slide per page, as big as the page itself
+            sizes = page_sizes(pdf)
+            w0, h0 = sizes[0]
+            lines = ["design.slideSize=" + json.dumps({"w": round(w0, 2), "h": round(h0, 2), "scale": "none",
+                                                       "orientation": "portrait" if h0 > w0 else "landscape"}),
+                     'slide.layout={"layout":"blank","index":0}']
+            for i, (png, (w, h)) in enumerate(zip(pngs, sizes)):
+                k = min(w0 / w, h0 / h)
+                rw, rh = w * k, h * k
+                if i:
+                    lines.append('slide.new={"layout":"blank"}')
+                lines.append("insert.picture=" + json.dumps({"path": str(png), "rect": [
+                    round((w0 - rw) / 2, 2), round((h0 - rh) / 2, 2), round(rw, 2), round(rh, 2)]}))
+            (d / "commands.txt").write_text("\n".join(lines) + "\n")
+            cmd = [str(tool), "run", "--cmd-file", str(d / "commands.txt"), "--save", str(out)]
+        else:
+            (d / "pages.html").write_text(pdf_to_html(pdf, pngs, pictures=(fmt == "docx-pages")))
+            cmd = [str(tool), "convert", str(d / "pages.html"), str(out)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0 or not Path(out).exists():
+            raise RuntimeError(f"{label} could not write it: {(r.stderr or r.stdout).strip()[-160:]}")
+    return label
+
+
+def convert_pdf_to_office_lo(pdf, out, fmt):
+    """The same with LibreOffice, when it is installed (kept as a fallback). Raises RuntimeError."""
+    office = libreoffice_path()
+    infilter, target = LO_EXPORT[fmt]
     WORK_DIR.mkdir(exist_ok=True)
     job = Path(tempfile.mkdtemp(prefix="export-", dir=WORK_DIR))
     try:
@@ -985,12 +1215,21 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             popover = Gtk.Popover()
             plist = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_top=6, margin_bottom=6,
                             margin_start=6, margin_end=6)
+            export_items = []
             for fmt, label in EXPORT_FORMATS:
                 item = Gtk.Button(label=label)
                 item.add_css_class("flat")
                 item.get_child().set_halign(Gtk.Align.START)
                 item.connect("clicked", lambda _b, f=fmt: (popover.popdown(), self.export_as(f)))
                 plist.append(item)
+                export_items.append((fmt, item))
+
+            def refresh_export_menu(*_):                           # apps may have been added since the last time
+                for f, it in export_items:
+                    ok = export_available(f)
+                    it.set_sensitive(ok)
+                    it.set_tooltip_text("" if ok else export_hint(f))
+            popover.connect("show", refresh_export_menu)
             popover.set_child(plist)
             menu.set_popover(popover)
             bar.append(menu)
@@ -1246,6 +1485,18 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.area.grab_focus()
             self.area.queue_draw()
 
+        def open_in_app(self, *_):
+            """Open this tab's original file in the app that edits that kind of file."""
+            src = self.cur.source
+            app = office_app_for(Path(src).suffix.lower()) if src else None
+            image = find_appimage(app) if app else None
+            exe = str(image) if image else (shutil.which(app) if app else None)
+            if not exe:
+                self.status.set_text("I can't find the app for this file.")
+                return
+            subprocess.Popen([exe, src], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.status.set_text(f"Opened “{Path(src).name}” in {OFFICE_APPS[app][0]}.")
+
         def on_new_tab(self, *_):
             self.switch_to(self.new_doc())
 
@@ -1310,6 +1561,13 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 row.append(x)
                 box.append(row)
                 self.tab_buttons[doc] = b
+            src = self.cur.source
+            app = office_app_for(Path(src).suffix.lower()) if src else None
+            show = bool(app) and office_available(app)
+            self.open_in.set_visible(show)
+            if show:
+                self.open_in.set_label(f"Open in {OFFICE_APPS[app][0]}")
+                self.open_in.set_tooltip_text("Open the original file in the app that edits it")
 
         # ---- selection ---------------------------------------------------------
         @property
@@ -1714,6 +1972,13 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             side.append(self.tabs_box)
             button("+ New note", self.on_new_tab, "A blank note in its own tab")
+            self.open_in = Gtk.Button(label="")
+            self.open_in.add_css_class("flat")
+            self.open_in.get_child().set_halign(Gtk.Align.START)
+            self.open_in.get_child().set_ellipsize(Pango.EllipsizeMode.END)
+            self.open_in.connect("clicked", self.open_in_app)
+            self.open_in.set_visible(False)
+            side.append(self.open_in)
             self.tab_css = Gtk.CssProvider()
             self.tab_css.load_from_string(("@define-color accent_bg_color #7c3aed; @define-color accent_color #7c3aed; "
                                       ".inkling-tab-active { background: alpha(#a78bfa, 0.25); border-radius: 6px; } "
@@ -1727,7 +1992,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                    "Open a PDF: write on it, highlight, then Export")
             button("Word, slides, Excel…", lambda *_: self.pick_file(
                 "Open a Word, PowerPoint, Excel or OpenDocument file", "Office files", sorted(OFFICE_EXTS),
-                self.add_slide_file), "It opens as pages you can write on: every page or slide becomes a PDF page")
+                self.add_slide_file), "Opened by the app on this computer that handles it (WordCraft, DeckCraft, GridCraft): every page becomes a PDF page")
             button("Picture…", lambda *_: self.pick_file(
                 "Add a picture", "Pictures", [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"], self.add_picture_file),
                 "Adds a picture to the tab you are in")
@@ -1936,7 +2201,9 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.items.extend(slides)
                     self.selected = None
                     self.area.queue_draw()
-                    self.status.set_text(f"Opened “{name}”: {len(slides)} page{'s' if len(slides) != 1 else ''}. "
+                    via = OPENED_WITH.pop(path, None)
+                    self.status.set_text(f"Opened “{name}”" + (f" with {via}" if via else "") +
+                                         f": {len(slides)} page{'s' if len(slides) != 1 else ''}. "
                                          "Scroll down to see them all and write on them.")
             if err:
                 self.discard_if_empty(doc)
@@ -2835,7 +3102,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             if fmt == "png":
                 dlg.select_folder(self.win, None, lambda d, res: self.export_picked(fmt, d, res, name, True))
             else:
-                dlg.set_initial_name(f"{name}.{fmt}")
+                dlg.set_initial_name(f"{name}.{EXPORT_INFO[fmt][0]}")
                 dlg.save(self.win, None, lambda d, res: self.export_picked(fmt, d, res, name, False))
 
         def export_picked(self, fmt, dlg, res, name, folder):
@@ -2844,8 +3111,9 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             except GLib.Error:
                 return                                       # cancelled
             target = Path(f.get_path())
-            if not folder and target.suffix.lower() != f".{fmt}":
-                target = target.with_name(target.name + f".{fmt}")
+            ext = EXPORT_INFO[fmt][0]
+            if not folder and target.suffix.lower() != f".{ext}":
+                target = target.with_name(target.name + f".{ext}")
             self.run_export(fmt, target, name)
 
         def run_export(self, fmt, target, name, done=None):
@@ -2872,12 +3140,13 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
             def work():
                 try:
-                    if fmt in OFFICE_FILTERS:
-                        convert_pdf_to_office(tmp_pdf, target, fmt)
-                        what = {"docx": "Word file. It keeps the look; long text may be split into boxes",
-                                "pptx": "PowerPoint. Each page is a slide",
-                                "odt": "OpenDocument text", "odp": "OpenDocument slides. Each page is a slide"}[fmt]
-                        msg = f"Saved {what}: {target}"
+                    if EXPORT_INFO[fmt][1]:
+                        used = export_office(fmt, tmp_pdf, target)
+                        what = {"docx-pages": "Word file, every page a picture", "pptx": "PowerPoint, every page a slide",
+                                "docx": "Word file with editable text (pen marks, highlights and pictures are not in it)",
+                                "odt": "OpenDocument text, editable (pen marks and highlights are not in it)",
+                                "rtf": "Rich text, editable (pen marks and highlights are not in it)"}[fmt]
+                        msg = f"Saved {what}, made with {used}: {target}"
                     elif fmt == "txt":
                         text = subprocess.run(["pdftotext", "-layout", str(tmp_pdf), "-"], capture_output=True,
                                               text=True, timeout=120).stdout
