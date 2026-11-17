@@ -698,6 +698,179 @@ def run(self):
         shutil.rmtree(d, ignore_errors=True)
         self.win.close()
         return False
+    if mode == "look5":
+        # not a check: wobbly hand-drawn shapes, before and after the pen is lifted ($INKLING_LOOK-shapes.png)
+        import math
+        import random
+        rng = random.Random(3)
+        self.set_view(1.0, 0, 0)
+
+        def draw(pts, snap):
+            self.snap_btn.set_active(snap)
+            self.begin(pts[0][0], pts[0][1], 0.5, False)
+            for p in pts[1:]:
+                self.extend(p[0], p[1], 0.5)
+            self.finish()
+
+        def wob(xy, a=2.2):
+            return [(x + rng.uniform(-a, a), y + rng.uniform(-a, a)) for x, y in xy]
+
+        def walk(vs, start=0.35, extra=0.05, per=18):
+            pts = []
+            for i, a in enumerate(vs):
+                b = vs[(i + 1) % len(vs)]
+                pts += [(a[0] + (b[0] - a[0]) * k / per + 8 * math.sin(k / 3), a[1] + (b[1] - a[1]) * k / per) for k in range(per)]
+            first = int(start * per)
+            return (pts + pts[:int(extra * len(pts)) + first])[first:]
+
+        def ring(cx, cy, rx, ry, rot=0.0):
+            return [(cx + rx * math.cos(t) * math.cos(rot) - ry * math.sin(t) * math.sin(rot),
+                     cy + rx * math.cos(t) * math.sin(rot) + ry * math.sin(t) * math.cos(rot))
+                    for t in (2 * math.pi * 1.04 * i / 60 for i in range(60))]
+        shapes = [wob(ring(110, 190, 70, 70)), wob(ring(300, 190, 90, 45, 0.4)), wob(walk([(420, 130), (560, 130), (560, 240), (420, 240)])),
+                  wob(walk([(660, 250), (740, 120), (820, 250)], 0.5)), wob([(110 + 4 * i, 380 + 8 * math.sin(i / 7)) for i in range(70)], 1.0)]
+        for row, snap in ((0, False), (1, True)):
+            for pts in shapes:
+                moved = [(x, y + row * 330) for x, y in pts]
+                draw(moved, snap)
+
+        def shot():
+            w, h = self.win.get_width(), self.win.get_height()
+            paint = Gtk.WidgetPaintable.new(self.win)
+            s_ = Gtk.Snapshot()
+            paint.snapshot(s_, w, h)
+            tex = self.get_renderer().render_texture(s_.to_node(), Graphene.Rect().init(0, 0, w, h))
+            tex.save_to_png(os.environ["INKLING_LOOK"] + "-shapes.png")
+            self.win.close()
+            return False
+        GLib.timeout_add(700, shot)
+        return False
+    if mode == "shapes":
+        import math
+        import random
+        import __main__ as host
+        rng = random.Random(7)
+        rs = host.recognize_shape
+
+        def wobble(xy, amp=1.6):
+            return [(x + rng.uniform(-amp, amp), y + rng.uniform(-amp, amp), 0.5) for x, y in xy]
+
+        def around(cx, cy, r, a0=0.0, sweep=2 * math.pi * 1.03, n=70, ry=None, rot=0.0):
+            ry = ry or r
+            out = []
+            for i in range(n):
+                t_ = a0 + sweep * i / (n - 1)
+                x, y = r * math.cos(t_), ry * math.sin(t_)
+                out.append((cx + x * math.cos(rot) - y * math.sin(rot), cy + x * math.sin(rot) + y * math.cos(rot)))
+            return out
+
+        def walk(vs, start=0.35, extra=0.04, per=24):
+            """Points along a closed polygon, starting part-way along the first side and going a bit past the start."""
+            pts = []
+            for i, a in enumerate(vs):
+                b = vs[(i + 1) % len(vs)]
+                pts += [(a[0] + (b[0] - a[0]) * k / per, a[1] + (b[1] - a[1]) * k / per) for k in range(per)]
+            m = len(pts)
+            first = int(start * per)
+            return (pts + pts[:int(extra * m) + first])[first:]
+
+        def dist(p, q):
+            return math.hypot(p[0] - q[0], p[1] - q[1])
+
+        def near(res, target, tol):
+            return any(dist(p, target) <= tol for p in res[1])
+        sq = lambda cx, cy, s, rot=0.0: [(cx + (x * math.cos(rot) - y * math.sin(rot)), cy + (x * math.sin(rot) + y * math.cos(rot)))
+                                          for x, y in ((-s / 2, -s / 2), (s / 2, -s / 2), (s / 2, s / 2), (-s / 2, s / 2))]
+
+        def ring_of(res):
+            """(centre, radii) of a result that should be a circle, the centre taken from its extent."""
+            xs_, ys_ = [p[0] for p in res[1]], [p[1] for p in res[1]]
+            c_ = ((max(xs_) + min(xs_)) / 2, (max(ys_) + min(ys_)) / 2)
+            return c_, [dist(p, c_) for p in res[1]]
+        r = rs(wobble(around(300, 300, 100)), 1.0)
+        (cc, rr) = ring_of(r) if r else ((0, 0), [0])
+        log("selftest shapes: a hand-drawn circle becomes a circle (radius, centre kept):", bool(r) and r[0] == "circle"
+            and abs(sum(rr) / len(rr) - 100) < 4 and max(rr) - min(rr) < 0.5 and dist(cc, (300, 300)) < 4)
+        r = rs(wobble(around(300, 300, 150, ry=70, rot=math.radians(25))), 1.0)
+        log("selftest shapes: a tilted oval becomes an ellipse:", bool(r) and r[0] == "ellipse")
+        r = rs(wobble(around(300, 300, 140, ry=80)), 1.0)
+        xs = [p[0] for p in r[1]] if r else [0, 0]
+        log("selftest shapes: a level oval comes out level and the right size:", bool(r) and r[0] == "ellipse"
+            and abs((max(xs) - min(xs)) - 280) < 12)
+        r = rs(wobble(walk([(100, 100), (320, 100), (320, 230), (100, 230)])), 1.0)
+        xs, ys = ([p[0] for p in r[1]], [p[1] for p in r[1]]) if r else ([0], [0])
+        log("selftest shapes: a rectangle started mid-edge stays a rectangle, upright, the right size:",
+            bool(r) and r[0] == "rectangle" and abs((max(xs) - min(xs)) - 220) < 10 and abs((max(ys) - min(ys)) - 130) < 10
+            and len({round(x, 3) for x in xs}) < 200)
+        r = rs(wobble(walk(sq(300, 300, 160))), 1.0)
+        log("selftest shapes: a square becomes a square:", bool(r) and r[0] == "square")
+        r = rs(wobble(walk(sq(300, 300, 150, math.radians(45)))), 1.0)
+        log("selftest shapes: a diamond is a square turned:", bool(r) and r[0] in ("square", "rectangle"))
+        tri = [(200, 100), (100, 300), (300, 300)]
+        r = rs(wobble(walk(tri, start=0.5)), 1.0)
+        log("selftest shapes: a triangle becomes a triangle with its corners where they were:", bool(r) and r[0] == "triangle"
+            and all(near(r, v, 9) for v in tri))
+        r = rs(wobble(walk([(100, 100), (340, 130), (250, 330), (120, 280)]), 1.0), 1.0)
+        log("selftest shapes: an uneven four-sided shape stays four-sided (not forced into a rectangle):",
+            bool(r) and r[0] == "quadrilateral")
+        line = wobble([(100 + 3 * i, 200 + 6 * math.sin(i / 8)) for i in range(80)], 0.8)
+        r = rs(line, 1.0)
+        log("selftest shapes: a wobbly line becomes a straight line between its ends:", bool(r) and r[0] == "line" and len(r[1]) == 2
+            and dist(r[1][0], line[0]) < 8 and dist(r[1][1], line[-1]) < 8)
+        r = rs(wobble([(100 + 3 * i, 200 + 0.05 * 3 * i) for i in range(80)], 0.3), 1.0)
+        log("selftest shapes: a nearly level line comes out exactly level:", bool(r) and abs(r[1][0][1] - r[1][1][1]) < 1e-9)
+        r = rs(wobble([(200 + 0.04 * 3 * i, 100 + 3 * i) for i in range(80)], 0.3), 1.0)
+        log("selftest shapes: a nearly upright line comes out exactly upright:", bool(r) and abs(r[1][0][0] - r[1][1][0]) < 1e-9)
+
+        none = {
+            "a wave": [(100 + 4 * i, 200 + 40 * math.sin(i / 5)) for i in range(70)],
+            "a spiral": around(300, 300, 5, 0, 6 * math.pi, 120, ry=5) and [(300 + (5 + 4 * t) * math.cos(t), 300 + (5 + 4 * t) * math.sin(t))
+                                                                              for t in (i / 10 for i in range(120))],
+            "a zigzag": [(100 + 20 * i, 200 + (50 if i % 2 else 0)) for i in range(14)],
+            "a small circle": around(300, 300, 9),
+            "an open arc": around(300, 300, 100, 0, math.pi * 1.1),
+            "an S": [(300 + 60 * math.sin(t / 8), 100 + 6 * t * 0.5 + 30 * math.sin(t / 3)) for t in range(60)],
+            "an L": [(100, 100 + 3 * i) for i in range(40)] + [(100 + 3 * i, 220) for i in range(1, 40)],
+        }
+        got = {name: rs([(x, y, 0.5) for x, y in pts] if len(pts[0]) == 2 else pts, 1.0) for name, pts in none.items()}
+        log("selftest shapes: writing, waves, spirals, zigzags, small or open marks are left alone:",
+            all(v is None for v in got.values()), {k: (v[0] if v else None) for k, v in got.items() if v})
+        log("selftest shapes: the same circle drawn small on screen (zoomed out) is writing, drawn big is a shape:",
+            rs(wobble(around(300, 300, 40)), 0.5) is None and rs(wobble(around(300, 300, 40)), 2.0) is not None)
+
+        # in the app: the pen is lifted and the stroke becomes the clean shape, as one undo step
+        self.set_view(1.0, 0, 0)
+        self.snap_btn.set_active(True)
+        n_undo, n_strokes = len(self.undo_stack), len(self.strokes)
+        ring = wobble(around(300, 300, 110))
+        self.begin(ring[0][0], ring[0][1], 0.5, False)
+        for p in ring[1:]:
+            self.extend(p[0], p[1], 0.5)
+        self.finish()
+        made = self.strokes[-1]
+        _c, radii = ring_of(("circle", made.pts))
+        log("selftest shapes in the app: lifting the pen makes a perfect circle:", len(self.strokes) == n_strokes + 1
+            and max(radii) - min(radii) < 0.5 and abs(sum(radii) / len(radii) - 110) < 5 and "circle" in self.status.get_text())
+        self.on_undo()
+        log("selftest shapes in the app: one undo removes it:", len(self.strokes) == n_strokes and len(self.undo_stack) == n_undo)
+        self.snap_btn.set_active(False)
+        ring = wobble(around(300, 300, 110))
+        self.begin(ring[0][0], ring[0][1], 0.5, False)
+        for p in ring[1:]:
+            self.extend(p[0], p[1], 0.5)
+        self.finish()
+        log("selftest shapes in the app: with the Shapes button off your own line stays as drawn:", len(self.strokes[-1].pts) == len(ring))
+        self.snap_btn.set_active(True)
+        self.set_mode("highlight")
+        bar = wobble([(100 + 4 * i, 400 + 3 * math.sin(i / 6)) for i in range(60)], 0.6)
+        self.begin(bar[0][0], bar[0][1], 0.5, False)
+        for p in bar[1:]:
+            self.extend(p[0], p[1], 0.5)
+        self.finish()
+        log("selftest shapes in the app: a highlighter stroke becomes a straight bar:", len(self.strokes[-1].pts) == 2
+            and self.strokes[-1].alpha < 1)
+        self.win.close()
+        return False
     if mode == "sections":
         d = tempfile.mkdtemp()
         os.environ["INKLING_CONFIG"] = f"{d}/cfg"

@@ -380,6 +380,156 @@ def seg_dist(px, py, ax, ay, bx, by):
     return math.hypot(px - ax - t * dx, py - ay - t * dy)
 
 
+def _resample(P, n):
+    """n points spaced evenly along the path P."""
+    seg = [math.hypot(P[i + 1][0] - P[i][0], P[i + 1][1] - P[i][1]) for i in range(len(P) - 1)]
+    total, out, j, acc = sum(seg), [], 0, 0.0
+    for k in range(n):
+        target = total * k / (n - 1)
+        while j < len(seg) - 1 and acc + seg[j] < target:
+            acc += seg[j]
+            j += 1
+        t = 0.0 if seg[j] == 0 else (target - acc) / seg[j]
+        out.append((P[j][0] + (P[j + 1][0] - P[j][0]) * t, P[j][1] + (P[j + 1][1] - P[j][1]) * t))
+    return out
+
+
+def _rdp(P, eps):
+    """Douglas-Peucker: the corners of a path (points that stick out more than eps from the line between the ends)."""
+    if len(P) < 3:
+        return list(P)
+    a, b = P[0], P[-1]
+    dmax, idx = 0.0, 0
+    for i in range(1, len(P) - 1):
+        d = seg_dist(P[i][0], P[i][1], a[0], a[1], b[0], b[1])
+        if d > dmax:
+            dmax, idx = d, i
+    if dmax > eps:
+        return _rdp(P[:idx + 1], eps)[:-1] + _rdp(P[idx:], eps)
+    return [a, b]
+
+
+def _angle_at(a, b, c):
+    """The angle in degrees at b between the lines to a and to c."""
+    v1, v2 = (a[0] - b[0], a[1] - b[1]), (c[0] - b[0], c[1] - b[1])
+    n = math.hypot(*v1) * math.hypot(*v2)
+    return 180.0 if n == 0 else math.degrees(math.acos(max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / n))))
+
+
+def _outline(vertices, scale):
+    """A closed polygon as many close points, so the smooth curve drawn through them keeps straight edges and corners."""
+    out = []
+    for i, a in enumerate(vertices):
+        b = vertices[(i + 1) % len(vertices)]
+        n = max(12, int(math.hypot(b[0] - a[0], b[1] - a[1]) * scale / 4))
+        out += [(a[0] + (b[0] - a[0]) * t / n, a[1] + (b[1] - a[1]) * t / n) for t in range(n)]
+    return out + [out[0]]
+
+
+def recognize_shape(pts, scale):
+    """Turn a hand-drawn straight line, circle, ellipse, rectangle, square or triangle into a clean one.
+    pts = [(x, y, pressure)] in world pixels; scale = screen pixels per world pixel.
+    Returns (kind, [(x, y, pressure)]), or None for anything else (writing, a wobbly curve, something small)."""
+    P = [(pts[0][0], pts[0][1])]
+    for p in pts[1:]:
+        if math.hypot(p[0] - P[-1][0], p[1] - P[-1][1]) > 0.5 / scale:
+            P.append((p[0], p[1]))
+    if len(P) < 8:
+        return None
+    xs, ys = [p[0] for p in P], [p[1] for p in P]
+    D = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+    if max(max(xs) - min(xs), max(ys) - min(ys)) * scale < 45:   # small marks are writing, not shapes
+        return None
+    L = sum(math.hypot(P[i + 1][0] - P[i][0], P[i + 1][1] - P[i][1]) for i in range(len(P) - 1))
+    chord = math.hypot(P[-1][0] - P[0][0], P[-1][1] - P[0][1])
+    pr = sum(p[2] for p in pts) / len(pts)
+
+    def done(kind, xy):
+        return kind, [(x, y, pr) for x, y in xy]
+
+    if chord > 0.8 * D:                                      # started and ended far apart: a line, or just a stroke
+        dev = max(seg_dist(q[0], q[1], P[0][0], P[0][1], P[-1][0], P[-1][1]) for q in P)
+        if L < 1.15 * chord and dev <= 0.05 * chord:
+            (x0, y0), (x1, y1) = P[0], P[-1]
+            ang = math.degrees(math.atan2(y1 - y0, x1 - x0)) % 180
+            if min(ang, 180 - ang) < 4:
+                y0 = y1 = (y0 + y1) / 2                      # level
+            elif abs(ang - 90) < 4:
+                x0 = x1 = (x0 + x1) / 2                      # upright
+            return done("line", [(x0, y0), (x1, y1)])
+        return None
+    if chord > 0.22 * L:                                     # an open curve is not a closed shape
+        return None
+
+    end = min(range(len(P) // 2, len(P)), key=lambda i: math.hypot(P[i][0] - P[0][0], P[i][1] - P[0][1]))
+    Q = _resample(P[:end + 1] + [P[0]], 80)                  # the loop ends where it comes back to its start (not past it)
+    n = len(Q)
+    mx, my = sum(q[0] for q in Q) / n, sum(q[1] for q in Q) / n
+    sxx = sum((q[0] - mx) ** 2 for q in Q) / n
+    syy = sum((q[1] - my) ** 2 for q in Q) / n
+    sxy = sum((q[0] - mx) * (q[1] - my) for q in Q) / n
+    th = 0.5 * math.atan2(2 * sxy, sxx - syy)
+    c, sn = math.cos(th), math.sin(th)
+    uv = [((q[0] - mx) * c + (q[1] - my) * sn, -(q[0] - mx) * sn + (q[1] - my) * c) for q in Q]
+    umin, umax = min(u for u, _ in uv), max(u for u, _ in uv)
+    vmin, vmax = min(v for _, v in uv), max(v for _, v in uv)
+    cu, cv, a, b = (umin + umax) / 2, (vmin + vmax) / 2, (umax - umin) / 2, (vmax - vmin) / 2
+    if a > 0 and b > 0:                                      # round? how far are the points from an ellipse
+        rs = [math.hypot((u - cu) / a, (v - cv) / b) for u, v in uv]
+        if sum(abs(r - 1) for r in rs) / n <= 0.07 and max(abs(r - 1) for r in rs) <= 0.22:
+            ex, ey = mx + cu * c - cv * sn, my + cu * sn + cv * c
+            if abs(a - b) <= 0.12 * max(a, b):
+                a = b = (a + b) / 2
+                th = 0.0
+            elif abs(math.degrees(th)) < 8:
+                th = 0.0
+            elif abs(math.degrees(th)) > 82:
+                a, b, th = b, a, 0.0
+            c, sn = math.cos(th), math.sin(th)
+            pts_e = [(ex + a * math.cos(t) * c - b * math.sin(t) * sn, ey + a * math.cos(t) * sn + b * math.sin(t) * c)
+                     for t in (2 * math.pi * k / 96 for k in range(97))]
+            return done("circle" if a == b else "ellipse", pts_e)
+
+    V = _rdp(Q, 0.05 * D)                                    # corners
+    if math.hypot(V[0][0] - V[-1][0], V[0][1] - V[-1][1]) < 0.1 * D:
+        V = V[:-1]
+    while len(V) > 3:                                        # a corner that is really a straight line (the pen started mid-edge)
+        flat = next((i for i in range(len(V)) if _angle_at(V[i - 1], V[i], V[(i + 1) % len(V)]) > 160), None)
+        if flat is None:
+            break
+        V.pop(flat)
+    k = len(V)
+    if k not in (3, 4):
+        return None
+    err = sum(min(seg_dist(q[0], q[1], V[i][0], V[i][1], V[(i + 1) % k][0], V[(i + 1) % k][1]) for i in range(k))
+              for q in Q) / n / D
+    if err > 0.05:
+        return None
+    if k == 3:
+        return done("triangle", _outline(V, scale))
+    angles = [_angle_at(V[i - 1], V[i], V[(i + 1) % 4]) for i in range(4)]
+    if not all(65 <= g <= 115 for g in angles):
+        return done("quadrilateral", _outline(V, scale))
+    edges = [(V[(i + 1) % 4][0] - V[i][0], V[(i + 1) % 4][1] - V[i][1]) for i in range(4)]
+    ex_, ey_ = max(edges, key=lambda e: math.hypot(*e))
+    rot = math.atan2(ey_, ex_)
+    deg = math.degrees(rot) % 90
+    if min(deg, 90 - deg) < 10:                              # nearly upright: make it exactly upright
+        rot = 0.0
+    c, sn = math.cos(rot), math.sin(rot)
+    rv = [(q[0] * c + q[1] * sn, -q[0] * sn + q[1] * c) for q in Q]
+    u0, u1 = min(u for u, _ in rv), max(u for u, _ in rv)
+    v0, v1 = min(v for _, v in rv), max(v for _, v in rv)
+    w, h = u1 - u0, v1 - v0
+    kind = "rectangle"
+    if abs(w - h) <= 0.12 * max(w, h):
+        side = (w + h) / 2
+        u0, u1, v0, v1 = (u0 + u1) / 2 - side / 2, (u0 + u1) / 2 + side / 2, (v0 + v1) / 2 - side / 2, (v0 + v1) / 2 + side / 2
+        kind = "square"
+    corners = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+    return done(kind, _outline([(u * c - v * sn, u * sn + v * c) for u, v in corners], scale))
+
+
 def stroke_centre(s):
     xs, ys = [p[0] for p in s.pts], [p[1] for p in s.pts]
     return (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
@@ -1324,6 +1474,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.nav_width = min(max(int(ui.get("nav_width", 190)), 120), 600)
             nav_open = bool(ui.get("nav_open", True))
             self.closed_sections = set(ui.get("closed_sections", []))     # sections folded away last time
+            self.snap_shapes = bool(ui.get("snap_shapes", True))
             self.sections = {}
             self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)   # drag the bar to resize
             self.sidebar = self.build_sidebar()
@@ -1446,6 +1597,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                                   lambda s: setattr(self, "eraser_px", s.get_value()))
                     bar.append(esize)
 
+            self.snap_btn = Gtk.ToggleButton(label="Shapes", active=self.snap_shapes)
+            self.snap_btn.set_tooltip_text("On: a line, circle, ellipse, triangle or rectangle you draw becomes a clean one "
+                                           "when you lift the pen. Writing and small marks are left alone.")
+            self.snap_btn.connect("toggled", lambda *_: self.save_ui())
+            bar.append(self.snap_btn)
             tsize = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 8, 72, 1)
             tsize.set_value(self.text_px)
             tsize.set_draw_value(False)
@@ -2118,7 +2274,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 config_dir().mkdir(parents=True, exist_ok=True)
                 self.ui_file().write_text(json.dumps(
                     {"nav_width": int(self.nav_width), "nav_open": self.sidebar.get_visible(),
-                     "closed_sections": sorted(self.closed_sections)}))
+                     "closed_sections": sorted(self.closed_sections),
+                     "snap_shapes": self.snap_btn.get_active()}))
             except OSError:
                 pass
 
@@ -2740,9 +2897,15 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.area.queue_draw()
 
         def finish(self):
-            tool, grab = self.gesture_tool, self.grab
+            tool, grab, drawn = self.gesture_tool, self.grab, self.current
             self.current = None
             self.grab = None
+            if tool == "draw" and drawn is not None and self.snap_btn.get_active():
+                found = recognize_shape(drawn.pts, self.zoom)           # a line, circle, triangle… drawn by hand becomes a clean one
+                if found:
+                    drawn.pts, drawn.cache = found[1], None
+                    self.status.set_text(f"Made a clean {found[0]}. Undo brings your own line back; "
+                                         "the Shapes button turns this off.")
             if tool == "textdrag" and not self.text_press["moved"]:
                 self.start_edit(self.text_press["item"])       # a click on a text box: type in it
             elif tool == "move" and grab:
