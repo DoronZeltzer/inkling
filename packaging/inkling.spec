@@ -23,7 +23,7 @@ a = Analysis(
     pathex=[ROOT],
     binaries=binaries,
     datas=[(os.path.join(ROOT, "assets"), "assets"), (os.path.join(ROOT, "selftest.py"), ".")],
-    hiddenimports=["selftest", "cairo", "pypdf", "cryptography", "yaml", "lxml", "PIL"]
+    hiddenimports=["selftest", "converter", "converter_ui", "cairo", "pypdf", "cryptography", "yaml", "lxml", "PIL"]
     + [f"gi.repository.{name}" for name in gi_versions],
     hooksconfig={"gi": {"module-versions": gi_versions, "icons": ["Adwaita", "hicolor"], "themes": ["Adwaita"],
                         "languages": ["en"]}},

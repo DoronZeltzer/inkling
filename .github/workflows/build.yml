@@ -46,7 +46,9 @@ jobs:
         run: pip install --break-system-packages pyinstaller pypdf
 
       - name: Does it run from the source?
-        run: python inkling.py check
+        run: |
+          python inkling.py check
+          python -c "from PIL import Image; Image.new('RGB', (60, 40), (200, 30, 30)).save('ci-pic.png')"
 
       - name: Build the Windows package
         run: bash packaging/windows/build.sh
@@ -67,6 +69,10 @@ jobs:
           if (Test-Path gui.txt) { Get-Content gui.txt }
           if (-not (Select-String -Path gui.txt -Pattern "window closed: True" -Quiet)) { throw "the window check did not pass" }
           if (-not (Get-ChildItem ci-notes -Filter *.png)) { throw "the note was not saved" }
+          foreach ($to in "jpg","pdf","webp") {
+            $c = Start-Process -FilePath "dist\Inkling\Inkling.exe" -ArgumentList "convert","ci-pic.png","--to",$to,"--out","$PWD\ci-conv" -Wait -PassThru
+            if ($c.ExitCode -ne 0 -or -not (Test-Path "ci-conv\ci-pic.$to")) { throw "the packaged app could not convert a picture to $to" }
+          }
 
       - name: Installer and zip
         shell: pwsh
@@ -101,7 +107,9 @@ jobs:
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Does it run from the source?
-        run: python inkling.py check
+        run: |
+          python inkling.py check
+          python -c "from PIL import Image; Image.new('RGB', (60, 40), (200, 30, 30)).save('ci-pic.png')"
 
       - name: Build the Mac app
         run: bash packaging/macos/build.sh
@@ -119,6 +127,10 @@ jobs:
           cat gui.txt || true
           grep -q "window closed: True" gui.txt
           ls ci-notes/*.png
+          for to in jpg pdf webp; do
+            "$app" convert ci-pic.png --to "$to" --out ci-conv
+            test -f "ci-conv/ci-pic.$to"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -138,3 +150,15 @@ jobs:
         with:
           files: downloads/*
           generate_release_notes: true
+          body: |
+            ## Downloads
+
+            - **Windows:** `Inkling-Setup.exe` (installer), or `Inkling-windows.zip` (unzip and run, no install).
+              Windows may say "Windows protected your PC" because the app is not signed yet: choose *More info*, then *Run anyway*.
+            - **Mac:** `Inkling-macos.zip`. Unzip it, then right-click `Inkling.app` and choose *Open* the first time
+              (the app is not signed yet, so a plain double-click is refused once).
+            - **Linux:** download the source code below, then run `./install.sh` (see the README).
+
+            Word, PowerPoint and Excel files, and the Word/PowerPoint exports, need the WordCraft, DeckCraft and GridCraft apps
+            (or LibreOffice). Everything else, including the converter for pictures, PDFs, text, data files and archives, works on its own.
+            The pen double-tap watcher is Linux-only.

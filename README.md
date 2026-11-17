@@ -9,6 +9,10 @@ A boundless canvas for a pen (or mouse): draw, write, mark up PDFs, sign them, a
 - **Word, slides and spreadsheets:** opened as pages you can write on. If you have WordCraft, DeckCraft and
   GridCraft, Inkling finds them and uses each for its own file types.
 - **Tabs:** every document opens in its own tab in the left panel.
+- **Converter:** *Convert files…* turns almost any file into almost any other: Word, slides, spreadsheets, PDF, text,
+  Markdown, HTML, JSON/YAML/CSV, pictures (PNG, JPEG, WebP, SVG, …), archives. Drop files in, pick a target, and it finds the
+  best route (for example Word → PDF → one picture per page), uses the apps on your computer, and converts many files at
+  once. Also from a terminal: `inkling.py convert report.docx --to pdf`. Audio and video work when `ffmpeg` is installed.
 - **Export:** PDF, Word, PowerPoint, OpenDocument, RTF, plain text, pictures, or an `.inkling` copy of the note.
 
 ## Where things are saved

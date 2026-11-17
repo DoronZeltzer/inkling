@@ -182,6 +182,18 @@ def log(*a):
             pass
 
 
+def say(*a):
+    """A line of output for the command-line commands: on the screen when there is one, and in INKLING_LOG if asked."""
+    if sys.stdout is not None:
+        print(*a)
+    if os.environ.get("INKLING_LOG"):
+        try:
+            with open(os.environ["INKLING_LOG"], "a", encoding="utf-8") as f:
+                print(*a, file=f)
+        except OSError:
+            pass
+
+
 def find_pen_device():
     """Return /dev/input/eventN of the stylus digitizer, or None."""
     try:
@@ -1385,6 +1397,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             super().__init__(application_id="local.inkling.canvas" + suffix,
                              flags=Gio.ApplicationFlags.HANDLES_OPEN)   # files from "Open with"
             self.win = None
+            self.conv_win = None      # the converter window, while it is open
             self.signing = None       # while drawing a new signature: what the surface held before
             self.text_cover = None    # set while retyping a line of a PDF's own text
             self.line_cache = {}      # (pdf, page) -> its text lines
@@ -1821,6 +1834,20 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.refresh_tabs()
             self.area.grab_focus()
             self.area.queue_draw()
+
+        def open_converter(self, *_, current=False):
+            """The converter window (one at a time). current=True: with the file this tab came from."""
+            files = [self.cur.source] if current and self.cur.source else []
+            if getattr(self, "conv_win", None) is not None:
+                self.conv_win.add_paths(files)
+                self.conv_win.present()
+                return
+            import converter
+            import converter_ui
+            if getattr(self, "converter", None) is None:
+                self.converter = converter.Converter(sys.modules[__name__])
+            self.conv_win = converter_ui.ConverterWindow(self, self.converter, files)
+            self.conv_win.present()
 
         def open_in_app(self, *_):
             """Open this tab's original file in the app that edits that kind of file."""
@@ -2376,6 +2403,12 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             button("Picture…", lambda *_: self.pick_file(
                 "Add a picture", "Pictures", [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"], self.add_picture_file),
                 "Adds a picture to the tab you are in", icons="image-x-generic")
+            head("CONVERT", "convert")
+            button("Convert files…", self.open_converter,
+                   "Turn files into other kinds: Word, PDF, pictures, spreadsheets, text, archives… Drop them in, pick what you want",
+                   icons="view-refresh-symbolic")
+            button("Convert this tab's file…", lambda *_: self.open_converter(current=True),
+                   "Open the converter with the file this tab came from")
             head("PDF PAGES", "pdf")
             button("Join another PDF…", lambda *_: self.pick_file(
                 "Add a PDF to this one", "PDF", [".pdf"], lambda p: self.add_slide_file(p, new_tab=False)),
@@ -4218,15 +4251,42 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
     return app.run([sys.argv[0], *files])
 
 
+def _say_into(lines):
+    def put(*a):
+        lines.append(" ".join(str(x) for x in a))
+        say(*a)
+    return put
+
+
+def run_convert(files, target, out_dir, hq=False):
+    """inkling convert FILE... --to FORMAT [--out FOLDER]: convert from the command line. Exit 0 if all worked."""
+    import converter
+    conv = converter.Converter(sys.modules[__name__])
+    bad = 0
+    for f in files:
+        fmt = conv.detect(f)
+        options = conv.targets(fmt) if fmt else {}
+        name = converter.ENDINGS.get(target.lower().lstrip("."), target.lower())
+        node = next((n for n in (name, name + "*", name + "~") if n in options), None)
+        if node is None:
+            say(f"{f}: cannot become {target}. " + (conv.why_not(fmt) if not options else "It can become: " + ", ".join(sorted(
+                n.rstrip("*~") for n in options))))
+            bad += 1
+            continue
+        try:
+            r = conv.convert(f, node, out_dir, hq=hq)
+            say(f"{f} -> {', '.join(str(p) for p in r['outputs'][:3])}{' …' if len(r['outputs']) > 3 else ''}  ({r['route']}, {r['seconds']:.1f} s)")
+        except converter.ConversionError as e:
+            say(f"{f}: {e}")
+            bad += 1
+    return 1 if bad else 0
+
+
 def run_check(out=None):
     """Report what this computer has, without opening a window. Exit 0 when Inkling can run."""
     ok = True
     lines = []
-
-    def say(*a):                                     # to the screen, and to a file if asked (a Windows app has no console)
-        lines.append(" ".join(str(x) for x in a))
-        if sys.stdout is not None:
-            print(*a)
+    say = _say_into(lines)
     say(f"Inkling on {sys.platform}, Python {sys.version.split()[0]}{' (packaged)' if FROZEN else ''}")
     try:
         import gi
@@ -4240,6 +4300,14 @@ def run_check(out=None):
         say(f"  missing: {what} needs {pkg}")
         ok = False
     say(f"  notes are kept in {NOTES_DIR}")
+    try:
+        import converter
+        import converter_ui  # noqa: F401
+        conv = converter.Converter(sys.modules[__name__])
+        say(f"  converter: ok ({len(conv.edges)} routes between {len(converter.FORMATS)} kinds of file)")
+    except Exception as e:  # noqa: BLE001
+        say(f"  converter: BROKEN ({e})")
+        ok = False
     for name, (label, _exts) in OFFICE_APPS.items():
         say(f"  {label}: {'found' if office_available(name) else 'not found (optional)'}")
     say("Everything needed is here." if ok else "Something needed is missing (see above).")
@@ -4252,6 +4320,11 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="mode", required=True)
     sub.add_parser("daemon")
+    cv = sub.add_parser("convert", help="convert files: inkling convert report.docx --to pdf")
+    cv.add_argument("files", nargs="+")
+    cv.add_argument("--to", required=True, help="what to turn them into: pdf, docx, png, jpg, xlsx, csv, md, zip…")
+    cv.add_argument("--out", help="put the results in this folder (default: next to each original)")
+    cv.add_argument("--sharp", action="store_true", help="300 dpi pictures from pages")
     chk = sub.add_parser("check", help="report what this computer has, without opening a window")
     chk.add_argument("--out", help="also write the report to this file")
     c = sub.add_parser("canvas")
@@ -4260,11 +4333,13 @@ def main():
     c.add_argument("--slides", help="a PowerPoint/OpenDocument/PDF file to lay out on the canvas")
     c.add_argument("files", nargs="*", help="notes (.inkling), pictures or slides to open")
     argv = [a for a in sys.argv[1:] if not a.startswith("-psn")]     # macOS adds this when an app is double-clicked
-    if argv and argv[0] not in ("daemon", "check", "canvas", "-h", "--help"):
+    if argv and argv[0] not in ("daemon", "check", "convert", "canvas", "-h", "--help"):
         argv = ["canvas"] + argv                                     # just file names ("Open with"): open them
     args = ap.parse_args(argv or ["canvas"])                         # no arguments (a double click): open a canvas
     if args.mode == "check":
         sys.exit(run_check(args.out))
+    if args.mode == "convert":
+        sys.exit(run_convert(args.files, args.to, args.out, args.sharp))
     if args.mode == "daemon":
         run_daemon()
     else:

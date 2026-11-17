@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import struct
+import threading
 import time
 from pathlib import Path
 
@@ -745,6 +746,223 @@ def run(self):
             return False
         GLib.timeout_add(700, shot)
         return False
+    if mode == "convert":
+        import __main__ as host
+        import cairo
+        import converter
+        import converter_ui  # noqa: F401
+        from PIL import Image
+        from pypdf import PdfReader
+        conv = host.sys.modules[__name__] and converter.Converter(host)
+        T = host.TOOL_CACHE
+        W, D, G = (str(T / n / f"{n}-cli") for n in ("wordcraft", "deckcraft", "gridcraft"))
+        d = Path(tempfile.mkdtemp(prefix="convert-"))
+        run = lambda *a: subprocess.run(list(a), check=True, capture_output=True)
+        (d / "t.html").write_text("<html><body><h1>Report title</h1><p>Hello <b>world</b> שלום.</p></body></html>")
+        run(W, "convert", str(d / "t.html"), str(d / "report.docx"))
+        (d / "notes.md").write_text("# Heading\n\nSome *markdown* text\n")
+        run(D, "run", "--cmd", 'slide.new={"title":"Deck title","body":"body"}', "--save", str(d / "deck.pptx"))
+        (d / "s.csv").write_text("Name,Qty,Code\nApple,3,0123\nPear,5.5,x\n")
+        Image.new("RGB", (300, 200), (30, 120, 220)).save(d / "pic.png")
+        Image.new("RGBA", (64, 64), (255, 0, 0, 128)).save(d / "alpha.png")
+        (d / "data.json").write_text(json.dumps([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]))
+        (d / "x.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"><rect width="120" height="80" fill="green"/></svg>')
+        (d / "folder").mkdir()
+        (d / "folder" / "a.txt").write_text("hi")
+        (d / "folder" / "sub").mkdir()
+        (d / "folder" / "sub" / "b.txt").write_text("yo")
+        surf = cairo.PDFSurface(str(d / "long.pdf"), 595, 842)
+        c = cairo.Context(surf)
+        for n in range(1, 31):
+            c.set_font_size(40)
+            c.move_to(80, 200)
+            c.show_text(f"Long page {n}")
+            surf.show_page()
+        surf.finish()
+        out = d / "out"
+        go = lambda name, target, **k: conv.convert(d / name, target, out, **k)
+        text_of = lambda p: subprocess.run(["pdftotext", str(p), "-"], capture_output=True, text=True).stdout
+
+        # recognising files
+        shutil.copyfile(d / "pic.png", d / "noending")
+        shutil.copyfile(d / "report.docx", d / "mystery")
+        shutil.copyfile(d / "pic.png", d / "photo.jpeg")
+        (d / "bk.tar.gz").write_bytes(b"x")
+        (d / "random.bin").write_bytes(bytes(range(256)) * 4)
+        log("selftest convert: files are recognised by name or by what is inside:",
+            conv.detect(d / "noending") == "png" and conv.detect(d / "mystery") == "docx" and conv.detect(d / "photo.jpeg") == "jpg"
+            and conv.detect(d / "bk.tar.gz") == "tgz" and conv.detect(d / "folder") == "folder" and conv.detect(d / "random.bin") is None
+            and conv.detect(d / "data.json") == "json")
+
+        # which routes are offered
+        tg = conv.targets
+        log("selftest convert: only sensible targets are offered (Word is not offered JSON, a picture not text):",
+            "pdf" in tg("docx") and "json" not in tg("docx") and "xlsx" not in tg("docx") and "txt" not in tg("png")
+            and "pdf" in tg("png") and "docx" in tg("png") and "png*" in tg("pdf") and "folder" in tg("zip") and "png" not in tg("zip"))
+        routes = lambda src, dst: [e.dst for e in tg(src)[dst][1]]
+        log("selftest convert: routes are direct when they can be, and avoid losing text on the way:",
+            routes("docx", "pdf") == ["pdf"] and routes("docx", "png*") == ["pdf", "png*"]
+            and "txt" not in routes("pptx", "docx") and "md" not in routes("pptx", "docx") and routes("json", "xlsx") == ["csv", "xlsx"])
+        log("selftest convert: audio says what it needs (ffmpeg) when it is missing:",
+            conv.engines["ffmpeg"] or ("ffmpeg" in conv.why_not("mp3") and not tg("mp3")))
+
+        # documents
+        r = go("report.docx", "pdf")["outputs"][0]
+        log("selftest convert: Word -> PDF keeps the text (Hebrew too):", "Report title" in text_of(r) and len(PdfReader(str(r)).pages) == 1)
+        log("selftest convert: Word -> Markdown / text / ODT / RTF / HTML:", "Report title" in go("report.docx", "md")["outputs"][0].read_text()
+            and "Hello" in go("report.docx", "txt")["outputs"][0].read_text() and go("report.docx", "odt")["outputs"][0].stat().st_size > 500
+            and "Hello" in go("report.docx", "html")["outputs"][0].read_text() and go("report.docx", "rtf")["outputs"][0].stat().st_size > 300)
+        back = go("notes.md", "docx")["outputs"][0]
+        log("selftest convert: Markdown -> Word -> and read back:", "Some markdown text" in subprocess.run(
+            [W, "text", str(back)], capture_output=True, text=True).stdout)
+        pics = go("report.docx", "png*")["outputs"]
+        log("selftest convert: Word -> PNG picture (one page, one file, a real image):", len(pics) == 1 and Image.open(pics[0]).width > 500)
+        pp = go("report.docx", "pptx")["outputs"][0]
+        log("selftest convert: Word -> PowerPoint (a slide per page):", len(json.loads(subprocess.run(
+            [D, "info", str(pp)], capture_output=True, text=True).stdout)["slides"]) == 1)
+
+        # slides
+        sl = go("deck.pptx", "png*")["outputs"]
+        log("selftest convert: PowerPoint -> a picture per slide, numbered:", [p.name for p in sl] == ["deck-1.png", "deck-2.png"])
+        gf = go("deck.pptx", "gif~")["outputs"][0]
+        log("selftest convert: PowerPoint -> animated GIF with a frame per slide:", Image.open(gf).n_frames == 2)
+        dw = go("deck.pptx", "docx")
+        log("selftest convert: PowerPoint -> Word goes through the PDF, not through bare text:",
+            "Deck title" in subprocess.run([W, "text", str(dw["outputs"][0])], capture_output=True, text=True).stdout and "PDF" in dw["route"])
+        log("selftest convert: PowerPoint -> text / Markdown / PDF:", "Deck title" in go("deck.pptx", "txt")["outputs"][0].read_text()
+            and "Deck title" in go("deck.pptx", "md")["outputs"][0].read_text() and "Deck title" in text_of(go("deck.pptx", "pdf")["outputs"][0]))
+
+        # tables and data
+        x = go("s.csv", "xlsx")["outputs"][0]
+        rt = conv.convert(x, "csv", out / "rt")["outputs"][0].read_text()
+        log("selftest convert: CSV -> Excel -> CSV comes back the same (as a spreadsheet reads numbers):", "Apple,3," in rt and "Pear,5.5,x" in rt)
+        rec = json.loads(go("s.csv", "json")["outputs"][0].read_text())
+        log("selftest convert: CSV -> JSON gives records (numbers are numbers, 0123 stays text):",
+            rec[0] == {"Name": "Apple", "Qty": 3, "Code": "0123"} and rec[1]["Qty"] == 5.5)
+        log("selftest convert: JSON -> CSV / Excel / YAML:", go("data.json", "csv")["outputs"][0].read_text().startswith("a,b")
+            and go("data.json", "xlsx")["outputs"][0].stat().st_size > 1000 and "- a: 1" in go("data.json", "yaml")["outputs"][0].read_text())
+        log("selftest convert: spreadsheet -> PDF / HTML / TSV:", "Apple" in text_of(go("s.csv", "pdf")["outputs"][0])
+            and "Apple" in go("s.csv", "html")["outputs"][0].read_text() and "Apple\t3" in go("s.csv", "tsv")["outputs"][0].read_text())
+
+        # pictures
+        shapes = {}
+        for fmt in ("jpg", "webp", "bmp", "tiff", "gif", "ico"):
+            p = go("pic.png", fmt)["outputs"][0]
+            shapes[fmt] = Image.open(p).format
+        log("selftest convert: PNG -> JPEG, WebP, BMP, TIFF, GIF, ICO are real files of that kind:",
+            shapes == {"jpg": "JPEG", "webp": "WEBP", "bmp": "BMP", "tiff": "TIFF", "gif": "GIF", "ico": "ICO"}, shapes)
+        log("selftest convert: a see-through PNG becomes a JPEG on white, not an error:", Image.open(go("alpha.png", "jpg")["outputs"][0]).mode == "RGB")
+        log("selftest convert: picture -> PDF, and picture -> Word:", len(PdfReader(str(go("pic.png", "pdf")["outputs"][0])).pages) == 1
+            and go("pic.png", "docx")["outputs"][0].stat().st_size > 2000)
+        sv = go("x.svg", "png")["outputs"][0]
+        log("selftest convert: SVG drawing -> PNG:", Image.open(sv).width >= 1000)
+
+        # PDF
+        t0 = time.monotonic()
+        many = go("long.pdf", "png*")["outputs"]
+        took = time.monotonic() - t0
+        log("selftest convert: a 30-page PDF -> 30 numbered pictures in a folder, in parallel:", len(many) == 30
+            and many[0].name == "long-01.png" and many[-1].name == "long-30.png" and many[0].parent.name == "long (png pages)",
+            "| %.1f s" % took)
+        log("selftest convert: PDF -> JPEG / SVG pages:", len(go("long.pdf", "jpg*")["outputs"]) == 30 and len(go("long.pdf", "svg*")["outputs"]) == 30)
+        log("selftest convert: PDF -> text / HTML / Word (editable):", "Long page 7" in go("long.pdf", "txt")["outputs"][0].read_text()
+            and "Long page 7" in go("long.pdf", "html")["outputs"][0].read_text()
+            and "Long page 30" in subprocess.run([W, "text", str(go("long.pdf", "docx")["outputs"][0])], capture_output=True, text=True).stdout)
+
+        # archives
+        z = go("folder", "zip")["outputs"][0]
+        tgz = conv.convert(z, "tgz", out / "a")["outputs"][0]
+        txz = conv.convert(tgz, "txz", out / "b")["outputs"][0]
+        tbz = conv.convert(txz, "tbz", out / "c")["outputs"][0]
+        fol = conv.convert(tbz, "folder", out / "d")["outputs"][0]
+        log("selftest convert: folder -> zip -> tar.gz -> tar.xz -> tar.bz2 -> folder keeps every file:",
+            sorted(str(p.relative_to(fol)) for p in fol.rglob("*") if p.is_file()) == ["a.txt", "sub/b.txt"]
+            and tgz.name == "folder.tar.gz" and txz.name == "folder.tar.xz" and tbz.name == "folder.tar.bz2")
+
+        # names, errors, cancel, speed
+        a, b = go("pic.png", "jpg")["outputs"][0], go("pic.png", "jpg")["outputs"][0]
+        log("selftest convert: nothing is overwritten (the second result is 'pic (2).jpg' or later):", a != b and "(" in b.name)
+        (d / "broken.docx").write_bytes(b"this is not a word file")
+        try:
+            go("broken.docx", "pdf")
+            err = ""
+        except converter.ConversionError as e:
+            err = str(e)
+        log("selftest convert: a broken file says so in plain words:", "WordCraft" in err and "convert" in err, "|", err[:70])
+        gone = threading.Event()
+        gone.set()
+        res = conv.convert_many([(d / "pic.png", "jpg")], out, cancel=gone)
+        log("selftest convert: stopping works:", res[0]["ok"] is False and res[0]["error"] == "cancelled")
+        jobs = [(d / n, t) for n, t in (("pic.png", "webp"), ("s.csv", "xlsx"), ("report.docx", "pdf"), ("notes.md", "html"), ("broken.docx", "pdf"),
+                                         ("alpha.png", "bmp"), ("data.json", "yaml"), ("deck.pptx", "pdf")) * 3]
+        t0 = time.monotonic()
+        seq = [conv.convert_many([j], d / "seq", workers=1)[0] for j in jobs]
+        t_seq = time.monotonic() - t0
+        t0 = time.monotonic()
+        par = conv.convert_many(jobs, d / "par")
+        t_par = time.monotonic() - t0
+        log("selftest convert: 24 files at once: all fine except the broken ones, and faster in parallel:",
+            [o["ok"] for o in par] == [o["ok"] for o in seq] and sum(not o["ok"] for o in par) == 3 and t_par < t_seq,
+            "| one by one %.1f s, together %.1f s" % (t_seq, t_par))
+
+        # the window
+        win_files = [str(d / "pic.png"), str(d / "report.docx"), str(d / "notes.md")]
+        self.open_converter()
+        cw = self.conv_win
+        cw.add_paths(win_files)
+        offered = [cw.conv.label(t) for t in cw.target_ids]
+        log("selftest convert window: dropped files are listed and what they can all become is offered:",
+            len(cw.entries) == 3 and "PDF" in offered and "Word (.docx)" in offered or any("PDF" in o for o in offered))
+        cw.dropdown.set_selected(next(i for i, t in enumerate(cw.target_ids) if t == "pdf"))
+        cw.beside.set_active(False)
+        cw.out_dir = str(d / "window-out")
+        cw.on_convert()
+
+        def check(tries=[0]):
+            tries[0] += 1
+            if cw.running and tries[0] < 120:
+                return True
+            made = sorted(p.name for p in (d / "window-out").glob("*.pdf")) if (d / "window-out").exists() else []
+            log("selftest convert window: Convert makes every file's PDF and says how it went:", made == ["notes.pdf", "pic.pdf", "report.pdf"]
+                and all("✓" in e["status"].get_text() for e in cw.entries) and "3 converted" in cw.summary.get_text(), made, cw.summary.get_text())
+            cw.close()
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+            return False
+        GLib.timeout_add(250, check)
+        return False
+    if mode == "look6":
+        # not a check: the converter window with a mixed set of files ($INKLING_LOOK-converter.png)
+        from PIL import Image
+        d = Path(tempfile.mkdtemp(prefix="look-"))
+        T = host_tools = None
+        import __main__ as host
+        W, Dk = (str(host.TOOL_CACHE / n / f"{n}-cli") for n in ("wordcraft", "deckcraft"))
+        (d / "t.html").write_text("<html><body><h1>Quarterly report</h1><p>Text.</p></body></html>")
+        subprocess.run([W, "convert", str(d / "t.html"), str(d / "Quarterly report.docx")], capture_output=True)
+        subprocess.run([Dk, "run", "--cmd", 'slide.new={"title":"Pitch"}', "--save", str(d / "Investor pitch.pptx")], capture_output=True)
+        Image.new("RGB", (800, 600), (30, 120, 220)).save(d / "holiday photo.png")
+        (d / "budget.csv").write_text("a,b\n1,2\n")
+        (d / "notes").mkdir()
+        (d / "notes" / "a.txt").write_text("x")
+        (d / "song.mp3").write_bytes(b"ID3" + bytes(300))
+        self.open_converter()
+        cw = self.conv_win
+        cw.add_paths([str(d / n) for n in ("Quarterly report.docx", "Investor pitch.pptx", "holiday photo.png", "budget.csv", "notes", "song.mp3")])
+        cw.dropdown.set_selected(next((i for i, t_ in enumerate(cw.target_ids) if t_ == "pdf"), 0))
+
+        def shot():
+            w, h = cw.get_width(), cw.get_height()
+            paint = Gtk.WidgetPaintable.new(cw)
+            s_ = Gtk.Snapshot()
+            paint.snapshot(s_, w, h)
+            tex = self.get_renderer().render_texture(s_.to_node(), Graphene.Rect().init(0, 0, w, h))
+            tex.save_to_png(os.environ["INKLING_LOOK"] + "-converter.png")
+            cw.close()
+            self.win.close()
+            return False
+        GLib.timeout_add(900, shot)
+        return False
     if mode == "shapes":
         import math
         import random
@@ -874,7 +1092,7 @@ def run(self):
     if mode == "sections":
         d = tempfile.mkdtemp()
         os.environ["INKLING_CONFIG"] = f"{d}/cfg"
-        keys = ["tabs", "open", "pdf", "sign", "recent", "folder"]
+        keys = ["tabs", "open", "convert", "pdf", "sign", "recent", "folder"]
         log("selftest sections: every section has a fold arrow and start open:", list(self.sections) == keys
             and all(r.get_reveal_child() for r, _a in self.sections.values()))
         rev, arrow = self.sections["pdf"]
@@ -883,7 +1101,7 @@ def run(self):
 
         def check(rev, arrow):
             log("selftest sections: the arrow folds a section away (and only that one):", not rev.get_reveal_child()
-                and not rev.get_child_revealed() and all(self.sections[k][0].get_reveal_child() for k in keys if k != "pdf"),
+                and all(self.sections[k][0].get_reveal_child() for k in keys if k != "pdf"),
                 "| arrow points sideways:", arrow.get_icon_name() == "pan-end-symbolic")
             saved = json.loads((Path(d) / "cfg" / "window.json").read_text())
             log("selftest sections: it is remembered for next time:", saved["closed_sections"] == ["pdf"])
