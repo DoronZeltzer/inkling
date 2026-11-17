@@ -15,6 +15,7 @@ Needs: python3-gi with GTK4, poppler-utils (pdftoppm, pdfinfo), python3-pypdf, p
 import argparse
 import fcntl
 import hashlib
+import html
 import io
 import json
 import math
@@ -305,11 +306,29 @@ def parse_pages(text, total):
     return out
 
 
+def pdf_text_lines(pdf, n):
+    """(page width, page height, [(text, x0, y0, x1, y1)]) for page n (1-based), in points from the
+    top-left of the crop box. No lines for a scanned page (it has no text to pick)."""
+    out = subprocess.run(["pdftotext", "-bbox-layout", "-cropbox", "-f", str(n), "-l", str(n), str(pdf), "-"],
+                         capture_output=True, text=True, timeout=60).stdout
+    size = re.search(r'<page width="([\d.]+)" height="([\d.]+)"', out)
+    if not size:
+        return 0.0, 0.0, []
+    lines = []
+    for m in re.finditer(r'<line xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">(.*?)</line>',
+                         out, re.S):
+        words = re.findall(r"<word[^>]*>(.*?)</word>", m.group(5), re.S)
+        text = html.unescape(" ".join(words)).strip()
+        if text:
+            lines.append((text, *map(float, m.groups()[:4])))
+    return float(size.group(1)), float(size.group(2)), lines
+
+
 def render_pdf_page(pdf, n):
     """PNG bytes of page n (1-based) of a PDF, SLIDE_RENDER_WIDTH pixels wide."""
     with tempfile.TemporaryDirectory(prefix="page-") as d:
         out = Path(d) / "p"
-        r = subprocess.run(["pdftoppm", "-png", "-singlefile", "-f", str(n), "-l", str(n),
+        r = subprocess.run(["pdftoppm", "-png", "-cropbox", "-singlefile", "-f", str(n), "-l", str(n),
                             "-scale-to-x", str(SLIDE_RENDER_WIDTH), "-scale-to-y", "-1",
                             str(pdf), str(out)], capture_output=True, text=True, timeout=120)
         png = Path(str(out) + ".png")
@@ -385,7 +404,7 @@ def convert_slides(path, progress=lambda text: None, on_page=None):
     ext = path.suffix.lower()
     if ext not in SLIDE_EXTS:
         raise RuntimeError("that isn't a PowerPoint, OpenDocument or PDF file")
-    key = f"{file_sha1(path)}-{SLIDE_RENDER_WIDTH}"
+    key = f"{file_sha1(path)}-{SLIDE_RENDER_WIDTH}c"      # "c": pictures show the crop box, like viewers
     cache = CACHE_DIR / key
     pdf_store = PDF_STORE / f"{key}.pdf"
     if _convert_lock.locked():
@@ -435,7 +454,7 @@ def convert_slides(path, progress=lambda text: None, on_page=None):
             def render(i):
                 out = cache / f"p-{i:03d}"              # -singlefile writes exactly <out>.png
                 r = subprocess.run(
-                    ["pdftoppm", "-png", "-singlefile", "-f", str(i), "-l", str(i),
+                    ["pdftoppm", "-png", "-cropbox", "-singlefile", "-f", str(i), "-l", str(i),
                      "-scale-to-x", str(SLIDE_RENDER_WIDTH), "-scale-to-y", "-1", str(pdf), str(out)],
                     capture_output=True, text=True, timeout=300)
                 png = Path(str(out) + ".png")
@@ -554,6 +573,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                              flags=Gio.ApplicationFlags.HANDLES_OPEN)   # files from "Open with"
             self.win = None
             self.signing = None       # while drawing a new signature: what the surface held before
+            self.text_cover = None    # set while retyping a line of a PDF's own text
+            self.line_cache = {}      # (pdf, page) -> its text lines
             self.erase_snapped = False
             self.strokes = []
             self.items = []           # pictures and text boxes
@@ -685,6 +706,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
             self.mode_btns = {}
             for name, label, tip in (("highlight", "Highlight", "Yellow highlighter"),
+                                     ("edittext", "Edit text", "Change text that is already in a PDF page"),
                                      ("eraser", "Eraser", "Erase pen strokes"),
                                      ("move", "Move", "Select, move and resize pictures and text"),
                                      ("text", "Text", "Tap to add a text box, tap one to edit it")):
@@ -703,6 +725,13 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                                   lambda s: setattr(self, "eraser_px", s.get_value()))
                     bar.append(esize)
 
+            tsize = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 8, 72, 1)
+            tsize.set_value(self.text_px)
+            tsize.set_draw_value(False)
+            tsize.set_size_request(90, -1)
+            tsize.set_tooltip_text("Text size (for new text, and for the text you have selected)")
+            tsize.connect("value-changed", self.on_text_size)
+            bar.append(tsize)
             add_button(bar, "Delete", self.on_delete_selected, "Delete the selected picture or text")
             add_button(bar, "Paste", self.on_paste, "Paste a picture from the clipboard (Ctrl+V)")
             tip = Gtk.Label(label="Drag with a finger to move around · drop pictures or slides here", hexpand=True, xalign=1)
@@ -821,6 +850,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             """Always show what the pen will do, so 'it doesn't draw' is never a mystery."""
             self.tool_label.set_text({
                 "pen": "Tool: Draw",
+                "edittext": "Tool: Edit text (click a line of text in a PDF, retype it, click away to finish)",
                 "highlight": "Tool: Highlight (yellow, for marking text)",
                 "eraser": "Tool: Eraser (pen strokes only)",
                 "move": "Tool: Move (pen drags pictures and text; pick a color to draw)",
@@ -838,7 +868,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         def on_color(self, btn, rgb):
             if btn.get_active():
                 self.color = rgb
-                if self.mode in ("eraser", "move", "highlight"):  # picking a color means "draw"
+                if self.mode in ("eraser", "move", "highlight", "edittext"):  # picking a color means "draw"
                     self.set_mode("pen")
 
         # ---- undo / redo -----------------------------------------------------
@@ -1217,6 +1247,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         def item_box(self, item):
             """(x, y, width, height) of an item in world pixels."""
+            if item.kind == "cover":                     # a patch over PDF text: width and height
+                return item.x, item.y, item.width, item.size
             if item.kind == "sign":
                 return item.x, item.y, item.width, item.width * item.sign["aspect"]
             if item.kind == "image":
@@ -1225,7 +1257,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             pw, ph = self.make_layout(item).get_pixel_size()
             return item.x, item.y, max(pw, 8), max(ph, 8)
 
-        def hit_item(self, cx, cy, kinds=("text", "sign", "image")):
+        def hit_item(self, cx, cy, kinds=("text", "sign", "cover", "image")):
             pad = 4 / self.zoom
             for kind in kinds:                       # text is drawn above pictures
                 for it in reversed(self.items):
@@ -1236,11 +1268,75 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         return it
             return None
 
-        def text_begin(self, x, y):
+        def on_text_size(self, scale):
+            self.text_px = scale.get_value()
+            sel = self.selected
+            if sel is not None and sel in self.items and sel.kind == "text":
+                sel.size = self.text_px / self.zoom
+                self.dirty = True
+                self.area.queue_draw()
+
+        def page_colours(self, page, rect):
+            """(background, ink) colours of the page picture around and inside rect, as 0..1 triples."""
+            import cairo
+            surf = cairo.ImageSurface.create_from_png(io.BytesIO(page.png))
+            data, stride, iw, ih = surf.get_data(), surf.get_stride(), surf.get_width(), surf.get_height()
+            bx, by, bw, _ = self.item_box(page)
+
+            def px(wx, wy):
+                i, j = min(max(int((wx - bx) * iw / bw), 0), iw - 1), min(max(int((wy - by) * iw / bw), 0), ih - 1)
+                o = j * stride + 4 * i                      # stored as blue, green, red, alpha
+                return data[o + 2] / 255, data[o + 1] / 255, data[o] / 255
+            x, y, w, h = rect
+            ring = ([px(x - 3, y + h * t) for t in (0.2, 0.5, 0.8)] + [px(x + w + 3, y + h * t) for t in (0.2, 0.5, 0.8)]
+                    + [px(x + w * t, y - 3) for t in (0.1, 0.5, 0.9)] + [px(x + w * t, y + h + 3) for t in (0.1, 0.5, 0.9)])
+            bg = tuple(sorted(c[k] for c in ring)[len(ring) // 2] for k in range(3))
+            far = max((px(x + w * a / 24, y + h * b / 6) for a in range(25) for b in range(1, 6)),
+                      key=lambda c: sum(abs(c[k] - bg[k]) for k in range(3)))
+            ink = far if sum(abs(far[k] - bg[k]) for k in range(3)) > 0.4 else (0.08, 0.08, 0.08)
+            return bg, ink
+
+        def line_cover(self, page, wx, wy):
+            """The line of the PDF's own text under a point: what Edit text needs to patch and retype it."""
+            src, idx = page.pdf
+            if (src, idx) not in self.line_cache:
+                self.line_cache[(src, idx)] = pdf_text_lines(src, idx + 1)
+            pw, _ph, lines = self.line_cache[(src, idx)]
+            if not pw:
+                return None
+            bx, by, bw, _ = self.item_box(page)
+            k, pad = bw / pw, 2 / self.zoom
+            for text, x0, y0, x1, y1 in lines:
+                r = (bx + x0 * k, by + y0 * k, (x1 - x0) * k, (y1 - y0) * k)
+                if r[0] - pad <= wx <= r[0] + r[2] + pad and r[1] - pad <= wy <= r[1] + r[3] + pad:
+                    bg, ink = self.page_colours(page, r)
+                    return {"rect": r, "text": text, "bg": bg, "fg": ink, "font": r[3] / 1.17}
+            return None
+
+        def edit_text_begin(self, x, y):
             wx, wy = self.to_world(x, y)
-            self.text_target = self.hit_item(wx, wy, kinds=("text",))
-            self.text_pos = (wx, wy)
-            self.textview.get_buffer().set_text(self.text_target.text if self.text_target else "")
+            if self.hit_item(wx, wy, kinds=("text",)):
+                self.text_begin(x, y)                        # text you typed: edit it as usual
+                return
+            page = next((p for p in self.pdf_pages()
+                         if self.item_box(p)[0] <= wx <= self.item_box(p)[0] + self.item_box(p)[2]
+                         and self.item_box(p)[1] <= wy <= self.item_box(p)[1] + self.item_box(p)[3]), None)
+            if page is None:
+                self.status.set_text("Click a line of text on an open PDF page.")
+                return
+            cover = self.line_cover(page, wx, wy)
+            if cover is None:
+                self.status.set_text("No text there. (A scanned page is a picture: use the Text tool to write over it.)")
+                return
+            self.text_begin(x, y, cover)
+
+        def text_begin(self, x, y, cover=None):
+            wx, wy = self.to_world(x, y)
+            self.text_target = None if cover else self.hit_item(wx, wy, kinds=("text",))
+            self.text_cover = cover
+            self.text_pos = (cover["rect"][0], cover["rect"][1]) if cover else (wx, wy)
+            self.textview.get_buffer().set_text(cover["text"] if cover else
+                                                (self.text_target.text if self.text_target else ""))
             rect = Gdk.Rectangle()
             rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
             self.popover.set_pointing_to(rect)
@@ -1262,14 +1358,23 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             buf = self.textview.get_buffer()
             text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
             target, self.text_target = self.text_target, None
+            cover, self.text_cover = self.text_cover, None
             if self.text_cancel:
                 return
-            self.commit_text(target, self.text_pos, text)
+            self.commit_text(target, self.text_pos, text, cover)
             self.area.grab_focus()
 
-        def commit_text(self, target, pos, text):
-            """Create a text box (target None) or change/delete an existing one."""
-            if target is not None and target in self.items:
+        def commit_text(self, target, pos, text, cover=None):
+            """Create a text box (target None) or change/delete an existing one. With `cover` (a line of
+            the PDF's own text) the old line is patched over with the page colour and the new text goes on top."""
+            if cover is not None:
+                if text != cover["text"]:                    # unchanged: leave the page alone
+                    x, y, w, h = cover["rect"]
+                    self.push_undo()
+                    self.items.append(Item("cover", x - 1, y - 1, width=w + 2, size=h + 2, color=cover["bg"]))
+                    if text:
+                        self.items.append(Item("text", x, y, text=text, size=cover["font"], color=cover["fg"]))
+            elif target is not None and target in self.items:
                 if not text:
                     self.push_undo()
                     self.items = [i for i in self.items if i is not target]
@@ -1294,6 +1399,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             if not erase and self.mode == "text":
                 self.gesture_tool = "text"
                 self.text_begin(x, y)
+                return
+            if not erase and self.mode == "edittext":
+                self.gesture_tool = "text"                      # nothing to drag: one click
+                self.edit_text_begin(x, y)
                 return
             wx, wy = self.to_world(x, y)
             self.erasing = erase or self.mode == "eraser"
@@ -1371,6 +1480,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.grab_snapped = True
             if kind == "move":
                 it.x, it.y = cx - a, cy - b
+            elif it.kind == "cover":
+                it.width, it.size = max(cx - it.x, 4.0), max(cy - it.y, 4.0)
             elif it.kind in ("image", "sign"):
                 it.width = max(cx - it.x, 12.0)
             else:  # resize text: scale the font by how far the corner moved
@@ -1441,6 +1552,12 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 for slides in self.pending.values():
                     for it in slides:
                         snapshot.append_texture(it.texture, Graphene.Rect().init(*self.item_box(it)))
+            for it in self.items:                                  # patches over edited PDF text, under the pen
+                if it.kind == "cover":
+                    rgba = Gdk.RGBA()
+                    rgba.red, rgba.green, rgba.blue = it.color
+                    rgba.alpha = 1.0
+                    snapshot.append_color(rgba, Graphene.Rect().init(it.x, it.y, it.width, it.size))
             for s in self.strokes:
                 rgba = Gdk.RGBA()
                 rgba.red, rgba.green, rgba.blue = s.color
@@ -1565,7 +1682,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     f = rule_for(it.x, it.y)
                     if f:
                         it.x, it.y = f(it.x, it.y)
-                elif it.kind == "sign":                      # a signature follows by its centre
+                elif it.kind in ("sign", "cover"):           # these follow by their centre
                     cx, cy = self.item_centre(it)
                     f = rule_for(cx, cy)
                     if f:
@@ -1584,7 +1701,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.strokes = [st for st in self.strokes if not inside(*stroke_centre(st))]
             self.items = [i for i in self.items
                           if i is not it and not (i.kind == "text" and inside(i.x, i.y))
-                          and not (i.kind == "sign" and inside(*self.item_centre(i)))]
+                          and not (i.kind in ("sign", "cover") and inside(*self.item_centre(i)))]
             below = [p for p in self.pdf_pages() if abs(p.x - it.x) < 1 and p.y > it.y]
             if below:                                        # pull the pages underneath up
                 dy = it.y - below[0].y
@@ -1620,6 +1737,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return
             from pypdf import PdfWriter
             src, idx = it.pdf
+            bx, by, bw, bh = self.item_box(it)
+            if any(i.kind == "cover" and bx <= self.item_centre(i)[0] <= bx + bw
+                   and by <= self.item_centre(i)[1] <= by + bh for i in self.items):
+                self.status.set_text("Turn the page before editing its text (edited text can't be turned).")
+                return
             try:
                 writer = PdfWriter(clone_from=src)
                 writer.pages[idx].rotate(90)
@@ -1790,7 +1912,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 if min(xs) <= x + w and max(xs) >= x and min(ys) <= y + h and max(ys) >= y:
                     return True
             for it in self.items:
-                if it.kind == "text":
+                if it.kind in ("text", "cover"):
                     bx, by, bw, bh = self.item_box(it)
                     if bx <= x + w and bx + bw >= x and by <= y + h and by + bh >= y:
                         return True
@@ -1815,6 +1937,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         ctx.set_source_surface(surf, 0, 0)
                         ctx.paint()
                         ctx.restore()
+            for it in self.items:                                  # patches first: they hide the old text
+                if it.kind == "cover":
+                    ctx.set_source_rgb(*it.color)
+                    ctx.rectangle(it.x, it.y, it.width, it.size)
+                    ctx.fill()
             ctx.set_line_cap(cairo.LINE_CAP_ROUND)
             ctx.set_line_join(cairo.LINE_JOIN_ROUND)
             for st in self.all_strokes():

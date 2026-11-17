@@ -22,7 +22,7 @@ def strip_link(text):
 
 def pixels(pdf, page, dpi=40):
     """RGB pixels of one page of a PDF: (width, height, bytes)."""
-    out = subprocess.run(["pdftoppm", "-r", str(dpi), "-f", str(page), "-l", str(page), "-singlefile", str(pdf)],
+    out = subprocess.run(["pdftoppm", "-cropbox", "-r", str(dpi), "-f", str(page), "-l", str(page), "-singlefile", str(pdf)],
                          capture_output=True, check=True).stdout
     head = out.split(b"\n", 3)
     w, h = map(int, head[1].split())
@@ -216,6 +216,84 @@ def run(self):
             "| saved_base:", self.saved_base)
         return False
 
+    if mode == "pdftext":
+        import cairo
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import RectangleObject
+        d = tempfile.mkdtemp()
+        raw, src = f"{d}/raw.pdf", f"{d}/one.pdf"
+        surf = cairo.PDFSurface(raw, 595, 842)
+        c = cairo.Context(surf)
+        c.set_source_rgb(1, 1, 1)
+        c.paint()
+        c.set_source_rgb(0, 0, 0)
+        c.set_font_size(40)
+        c.move_to(80, 200)
+        c.show_text("Original line")
+        c.move_to(80, 300)
+        c.show_text("Second line")
+        surf.finish()
+        wr = PdfWriter(clone_from=raw)
+        wr.pages[0].cropbox = RectangleObject([30, 40, 565, 800])      # crop box inside the media box
+        with open(src, "wb") as f:
+            wr.write(f)
+        dark = lambda r_, g, b: r_ < 110 and g < 110 and b < 110
+
+        def band(pdf, y0, y1):
+            w, h, data = pixels(pdf, 1)
+            return sum(1 for i in range(0, len(data) - 2, 3)
+                       if y0 <= (i // 3) // w / h <= y1 and dark(data[i], data[i + 1], data[i + 2]))
+
+        def after():
+            page = self.pdf_pages()[0]
+            bx, by, bw, bh = self.item_box(page)
+            w, h, data = pixels(src, 1)
+            ys = [(i // 3) // w / h for i in range(0, len(data) - 2, 3) if dark(data[i], data[i + 1], data[i + 2])
+                  and (i // 3) // w / h < 0.26]
+            xs = [(i // 3) % w / w for i in range(0, len(data) - 2, 3) if dark(data[i], data[i + 1], data[i + 2])
+                  and (i // 3) // w / h < 0.26]
+            fx, fy = sum(xs) / len(xs), sum(ys) / len(ys)              # where the first line really is (0..1)
+            cover = self.line_cover(page, bx + fx * bw, by + fy * bh)
+            ok = cover is not None
+            rx, ry, rw, rh = cover["rect"] if ok else (0, 0, 1, 1)
+            log("selftest pdftext: line found under the click:", ok and cover["text"] == "Original line",
+                "| its box sits on the real text:", abs((rx + rw / 2 - bx) / bw - fx) < 0.12 and abs((ry + rh / 2 - by) / bh - fy) < 0.03,
+                "| page colour white, ink dark:", ok and min(cover["bg"]) > 0.95 and max(cover["fg"]) < 0.3)
+            log("selftest pdftext: empty spot finds nothing:", self.line_cover(page, bx + 0.5 * bw, by + 0.9 * bh) is None)
+
+            before_1, before_2 = band(src, 0.12, 0.26), band(src, 0.28, 0.42)
+            self.commit_text(None, (rx, ry), "Original line", cover)
+            log("selftest pdftext: unchanged text changes nothing:", not [i for i in self.items if i.kind == "cover"])
+            self.commit_text(None, (rx, ry), "", cover)                # delete the line
+            gone = f"{d}/gone.pdf"
+            self.export_pdf(gone)
+            log("selftest pdftext delete: line is covered in the PDF:", band(gone, 0.12, 0.26) < before_1 * 0.03,
+                "| next line untouched:", band(gone, 0.28, 0.42) == before_2)
+            self.on_undo()
+            log("selftest pdftext undo: original comes back:", not [i for i in self.items if i.kind == "cover"])
+
+            self.commit_text(None, (rx, ry), "Changed it", cover)       # retype the line
+            new = f"{d}/new.pdf"
+            self.export_pdf(new)
+            kinds = sorted(i.kind for i in self.items if i.kind in ("cover", "text"))
+            log("selftest pdftext retype: a patch and the new text:", kinds == ["cover", "text"],
+                "| new text is drawn there:", 0 < band(new, 0.12, 0.26) < before_1 * 3,
+                "| next line untouched:", band(new, 0.28, 0.42) == before_2)
+            self.selected = page
+            self.rotate_page()
+            log("selftest pdftext: turning an edited page is refused:", "Turn the page before" in self.status.get_text())
+
+            self.name_entry.set_text("text edit note")
+            self.save()
+            self.strokes, self.items = [], []
+            self.open_note("text edit note")
+            log("selftest pdftext reopen: patch and text came back:",
+                sorted(i.kind for i in self.items if i.kind in ("cover", "text")) == ["cover", "text"])
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+
+        self.add_slide_file(src, done=after)
+        return False
     if mode == "pdf":
         import cairo
         from pypdf import PdfReader
@@ -232,6 +310,12 @@ def run(self):
             c.show_text(f"Page {n}")
             surf.show_page()
         surf.finish()
+        from pypdf import PdfWriter
+        from pypdf.generic import RectangleObject
+        base_pdf = PdfWriter(clone_from=src)
+        base_pdf.pages[1].cropbox = RectangleObject([30, 40, 565, 800])
+        with open(src, "wb") as f:
+            base_pdf.write(f)
 
         def after():
             pages = self.pdf_pages()
