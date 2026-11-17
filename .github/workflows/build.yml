@@ -33,14 +33,17 @@ jobs:
             mingw-w64-ucrt-x86_64-python-cryptography
             mingw-w64-ucrt-x86_64-python-yaml
             mingw-w64-ucrt-x86_64-python-lxml
-            mingw-w64-ucrt-x86_64-python-pyinstaller
+            mingw-w64-ucrt-x86_64-python-setuptools
+            mingw-w64-ucrt-x86_64-python-wheel
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-zlib
             mingw-w64-ucrt-x86_64-gtk4
             mingw-w64-ucrt-x86_64-poppler
             mingw-w64-ucrt-x86_64-librsvg
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
 
-      - name: Python helpers that are not packaged for MSYS2
-        run: pip install --break-system-packages pypdf
+      - name: Python helpers that are not packaged for MSYS2 (PyInstaller builds its small starter program here)
+        run: pip install --break-system-packages pyinstaller pypdf
 
       - name: Does it run from the source?
         run: python inkling.py check

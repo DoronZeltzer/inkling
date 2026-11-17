@@ -1,9 +1,11 @@
 # PyInstaller recipe for the Windows and macOS downloads (run from the repository root: pyinstaller packaging/inkling.spec).
 # The Linux version is the source folder itself (see install.sh).
+import os
 import shutil
 import sys
 
-ICON = "packaging/windows/inkling.ico" if sys.platform == "win32" else "packaging/macos/inkling.icns"
+ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))        # SPECPATH: the folder of this file (set by PyInstaller)
+ICON = os.path.join(ROOT, "packaging", "windows", "inkling.ico" if sys.platform == "win32" else "macos/inkling.icns")
 
 # helper programs the app starts: they travel inside the package, in a "bin" folder
 binaries = []
@@ -16,10 +18,10 @@ gi_versions = {"Gtk": "4.0", "Gdk": "4.0", "Gsk": "4.0", "Graphene": "1.0", "Pan
                "GdkPixbuf": "2.0", "Gio": "2.0", "GLib": "2.0", "GObject": "2.0"}
 
 a = Analysis(
-    ["inkling.py"],
-    pathex=["."],
+    [os.path.join(ROOT, "inkling.py")],
+    pathex=[ROOT],
     binaries=binaries,
-    datas=[("assets", "assets"), ("selftest.py", ".")],
+    datas=[(os.path.join(ROOT, "assets"), "assets"), (os.path.join(ROOT, "selftest.py"), ".")],
     hiddenimports=["selftest", "cairo", "pypdf", "cryptography", "yaml", "lxml", "PIL"]
     + [f"gi.repository.{name}" for name in gi_versions],
     hooksconfig={"gi": {"module-versions": gi_versions, "icons": ["Adwaita", "hicolor"], "themes": ["Adwaita"],
