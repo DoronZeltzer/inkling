@@ -10,7 +10,8 @@ Each save writes, into the Obsidian vault: a PNG of everything on the canvas, a 
 note that embeds it (with an "Edit in Pen Note" link), and a hidden editable copy so the note
 can be opened and continued. "Save PDF" keeps opened PDF pages sharp and puts your marks on top.
 
-Needs: python3-gi with GTK4, poppler-utils (pdftoppm, pdfinfo), python3-pypdf, python3-cairo.
+Needs: python3-gi with GTK4 and python3-gi-cairo, poppler-utils (pdftoppm, pdftotext, pdfinfo),
+python3-pypdf, python3-cairo, and for digital signatures: pyhanko (pip install --user pyhanko).
 """
 import argparse
 import fcntl
@@ -18,6 +19,7 @@ import hashlib
 import html
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -429,11 +431,97 @@ def strip_text_in_rects(page, rects):
     return removed
 
 
+class PasswordNeeded(Exception):
+    """A PDF asks for a password (wrong=True: the one given did not work)."""
+    def __init__(self, wrong=False):
+        super().__init__("password needed")
+        self.wrong = wrong
+
+
+def config_dir():
+    return Path(os.environ.get("PEN_NOTE_CONFIG") or Path.home() / ".config" / "pen-note")
+
+
+def make_certificate(name, email, password, path):
+    """A personal (self-made) signing certificate, saved as a password-protected .p12 file."""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.serialization import pkcs12
+    from cryptography.x509.oid import NameOID
+    key = rsa.generate_private_key(65537, 2048)
+    who = [x509.NameAttribute(NameOID.COMMON_NAME, name)]
+    if email:
+        who.append(x509.NameAttribute(NameOID.EMAIL_ADDRESS, email))
+    who = x509.Name(who)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(who).issuer_name(who).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=True, key_encipherment=False,
+                                         data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                                         crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+            .sign(key, hashes.SHA256()))
+    data = pkcs12.serialize_key_and_certificates(name.encode(), key, cert, None,
+                                                 serialization.BestAvailableEncryption(password.encode()))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    os.chmod(path, 0o600)
+
+
+def load_signer(p12, password):
+    from pyhanko.sign import signers
+    logging.getLogger("pyhanko").setLevel(logging.CRITICAL)
+    logging.getLogger("pyhanko_certvalidator").setLevel(logging.CRITICAL)
+    signer = signers.SimpleSigner.load_pkcs12(pfx_file=str(p12), passphrase=password.encode())
+    if signer is None:
+        raise ValueError("wrong password, or not a certificate file")
+    return signer
+
+
+def sign_pdf(src, dst, p12, password, stamp=None, reason=""):
+    """Sign a PDF with a certificate. `stamp` = (page index, (x0, y0, x1, y1)) puts a visible note
+    (who signed, when) there; without it the signature is invisible. Returns who signed and whether
+    the certificate is self-made."""
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.sign import fields, signers
+    from pyhanko.stamp import TextStampStyle
+    signer = load_signer(p12, password)
+    with open(src, "rb") as f:
+        writer = IncrementalPdfFileWriter(f)
+        style = None
+        if stamp:
+            fields.append_signature_field(writer, fields.SigFieldSpec("PenNoteSignature", on_page=stamp[0], box=stamp[1]))
+            style = TextStampStyle(stamp_text="Digitally signed by\n%(signer)s\n%(ts)s")
+        meta = signers.PdfSignatureMetadata(field_name="PenNoteSignature", reason=reason or None)
+        with open(dst, "wb") as out:
+            signers.PdfSigner(meta, signer=signer, stamp_style=style).sign_pdf(writer, output=out)
+    cert = signer.signing_cert
+    return {"name": cert.subject.native.get("common_name", ""), "self_signed": cert.self_signed in ("yes", "maybe")}
+
+
+def check_signature(path):
+    """True if the PDF's last signature is genuine and the file hasn't changed since."""
+    from pyhanko.pdf_utils.reader import PdfFileReader
+    from pyhanko.sign.validation import validate_pdf_signature
+    logging.getLogger("pyhanko").setLevel(logging.CRITICAL)
+    logging.getLogger("pyhanko_certvalidator").setLevel(logging.CRITICAL)
+    with open(path, "rb") as f:
+        sigs = PdfFileReader(f).embedded_signatures
+        if not sigs:
+            return False
+        status = validate_pdf_signature(sigs[-1])
+        return bool(status.intact and status.valid)
+
+
 def prune_pdf_store(days=14):
     cutoff = time.time() - days * 86400
     try:
-        for f in PDF_STORE.iterdir():
-            if f.is_file() and f.stat().st_mtime < cutoff:
+        for f in PDF_STORE.iterdir():       # unlocked copies of password-protected files never stay around
+            if f.is_file() and (f.name.startswith("prot-") or f.stat().st_mtime < cutoff):
                 f.unlink(missing_ok=True)
     except OSError:
         pass
@@ -492,23 +580,48 @@ def file_sha1(path):
     return h.hexdigest()
 
 
-def convert_slides(path, progress=lambda text: None, on_page=None):
+def convert_slides(path, progress=lambda text: None, on_page=None, password=None):
     """Turn a PowerPoint/OpenDocument/PDF file into PDF pages that can be laid out.
 
     A PDF is used as it is; PowerPoint is slow (LibreOffice needs most of a minute for a big deck), so
     call this off the UI thread. `progress(text)` reports what it is doing and
     `on_page(number, total, ratio, pdf_path)` is called for each page, in order (ratio = height / width).
     The pages themselves are drawn later, as they come into view. A file that was converted before
-    comes straight from the store. Returns the number of pages. Raises RuntimeError."""
+    comes straight from the store. A password-protected PDF needs `password` (PasswordNeeded otherwise);
+    its pages are then used from an unlocked copy that is cleared the next time Pen Note starts.
+    Returns the number of pages. Raises RuntimeError."""
     path = Path(path)
     ext = path.suffix.lower()
     if ext not in SLIDE_EXTS:
         raise RuntimeError("that isn't a PowerPoint, OpenDocument or PDF file")
-    pdf_store = PDF_STORE / f"{file_sha1(path)}.pdf"
+    key = file_sha1(path)
+    pdf_store = PDF_STORE / f"{key}.pdf"
+    locked = None
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+            locked = PdfReader(str(path))
+            if not locked.is_encrypted:
+                locked = None
+            elif not locked.decrypt(password or ""):
+                raise PasswordNeeded(wrong=bool(password))
+        except PasswordNeeded:
+            raise
+        except Exception:  # noqa: BLE001
+            locked = None                                # unreadable: the normal path reports it below
+    if locked is not None:
+        pdf_store = PDF_STORE / f"prot-{key}.pdf"
     if _convert_lock.locked():
         progress("Waiting for the other deck to finish…")
     with _convert_lock:
-        if pdf_store.exists():                           # converted before: instant
+        if locked is not None:                           # never reuse an old unlocked copy: ask every time
+            from pypdf import PdfWriter
+            PDF_STORE.mkdir(parents=True, exist_ok=True)
+            tmp = pdf_store.with_suffix(".tmp")
+            with open(tmp, "wb") as f:
+                PdfWriter(clone_from=locked).write(f)
+            os.replace(tmp, pdf_store)
+        elif pdf_store.exists():                         # converted before: instant
             progress("Found this deck in the cache")
             os.utime(pdf_store)
         else:
@@ -662,6 +775,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.signing = None       # while drawing a new signature: what the surface held before
             self.text_cover = None    # set while retyping a line of a PDF's own text
             self.line_cache = {}      # (pdf, page) -> its text lines
+            self.pdf_passwords = {}   # a PDF in use -> the password it was opened with (saved copies get it back)
+            self.deck_password = {}   # file being opened -> password given for it
             self.tex_cache = OrderedDict()   # (pdf, page) -> picture of that page, newest last
             self.tex_pending = set()         # pages being drawn right now
             self.tex_failed = set()
@@ -1161,6 +1276,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             head("SIGN")
             button("Sign", self.on_sign, "Place your signature on the page (you draw it the first time)")
             button("New signature…", self.start_signature, "Draw your signature again")
+            button("Sign digitally…", self.on_sign_digitally,
+                   "Save the PDF with a cryptographic signature that shows if it is changed afterwards")
             self.sign_row = Gtk.Box(spacing=6, visible=False)
             for label, cb in (("Done", self.finish_signature), ("Cancel", self.cancel_signature)):
                 b = Gtk.Button(label=label)
@@ -1223,7 +1340,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.status.set_text(text)
             return False
 
-        def add_slide_file(self, path, done=None):
+        def add_slide_file(self, path, done=None, password=None):
             """Convert a deck in the background; its slides appear one by one as they are ready."""
             name = Path(path).name
             if path in self.importing:
@@ -1232,6 +1349,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     done()
                 return
             self.importing.add(path)
+            self.deck_password[path] = password
             self.spinner.set_visible(True)
             self.spinner.start()
             self.show_progress(f"Opening “{name}”…")
@@ -1242,12 +1360,45 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     n = convert_slides(
                         path,
                         lambda t: GLib.idle_add(self.show_progress, label + t),
-                        lambda i, total, ratio, pdf: GLib.idle_add(self.slide_ready, path, name, i, total, ratio, pdf))
+                        lambda i, total, ratio, pdf: GLib.idle_add(self.slide_ready, path, name, i, total, ratio, pdf),
+                        password)
                     err = None
+                except PasswordNeeded as e:
+                    GLib.idle_add(self.slides_done, path, name, 0, None, None)
+                    GLib.idle_add(self.ask_password, path, name, done, e.wrong)
+                    return
                 except Exception as e:  # noqa: BLE001
                     n, err = 0, str(e)
                 GLib.idle_add(self.slides_done, path, name, n, err, done)
             threading.Thread(target=work, daemon=True).start()
+
+        def ask_password(self, path, name, done, wrong):
+            dlg = Gtk.Window(title="Password needed", transient_for=self.win, modal=True, default_width=360)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                          margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+            msg = Gtk.Label(wrap=True, xalign=0, label=(
+                f"“{name}” is password-protected.\n" + ("That password didn't work. Try again." if wrong else
+                                                       "Type its password to open it.")))
+            entry = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
+            row = Gtk.Box(spacing=6, halign=Gtk.Align.END)
+            cancel, ok = Gtk.Button(label="Cancel"), Gtk.Button(label="Open")
+            ok.add_css_class("suggested-action")
+            row.append(cancel)
+            row.append(ok)
+            for w in (msg, entry, row):
+                box.append(w)
+            dlg.set_child(box)
+
+            def go(*_):
+                pw = entry.get_text()
+                dlg.close()
+                self.add_slide_file(path, done, password=pw)
+            ok.connect("clicked", go)
+            entry.connect("activate", go)
+            cancel.connect("clicked", lambda *_: (dlg.close(), done() if done else None))
+            dlg.present()
+            entry.grab_focus()
+            return False
 
         def slide_ready(self, path, name, i, total, ratio, pdf):
             """One more slide arrived: show it straight away, below the previous one.
@@ -1268,6 +1419,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.pending[path] = []
                     z = min(1.0, (w - 80) / SLIDE_DISPLAY_WIDTH)
                     self.set_view(z, 40 - x0 * z, 40 - y0 * z)   # first slide at the top-left of the view
+                if self.deck_password.get(path):               # keep the password: Save PDF locks the result again
+                    self.pdf_passwords[pdf] = self.deck_password[path]
                 height = SLIDE_DISPLAY_WIDTH * ratio
                 self.pending[path].append(Item("image", st["x"], st["y"], width=SLIDE_DISPLAY_WIDTH,
                                                ratio=ratio, pdf=(pdf, i - 1)))
@@ -1280,6 +1433,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
 
         def slides_done(self, path, name, n, err, done):
             self.importing.discard(path)
+            self.deck_password.pop(path, None)
             self.deck_state.pop(path, None)
             slides = self.pending.pop(path, [])
             if not self.importing:
@@ -1905,6 +2059,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return
             from pypdf import PdfWriter
             src, idx = it.pdf
+            first_src = src
             x, y, w, h = self.item_box(it)
             loose = self.unturnable(it)
             flat = new = None
@@ -1912,7 +2067,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 PDF_STORE.mkdir(parents=True, exist_ok=True)
                 if loose:          # make the page's marks part of the page itself, so the turn carries them
                     flat = PDF_STORE / f"flat-{os.getpid()}-{time.time_ns()}.pdf"
-                    self.export_pdf(flat, [self.pdf_pages().index(it) + 1])
+                    self.export_pdf(flat, [self.pdf_pages().index(it) + 1], protect=False)
                     src, idx = str(flat), 0
                 writer = PdfWriter(clone_from=src)
                 writer.pages[idx].rotate(90)
@@ -1938,13 +2093,15 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             # a clockwise quarter turn: a point u across and v down the page lands h - v across, u down
             self.transform_marks([((x, y, w, h), lambda px, py: (x + h - (py - y), y + (px - x)))])
             it.pdf, it.width, it.ratio = (str(new), idx), h, 1 / it.ratio
+            if first_src in self.pdf_passwords:
+                self.pdf_passwords[str(new)] = self.pdf_passwords[first_src]
             self.status.set_text("Page turned. Undo turns it back."
                                  + (" Its text, signature and marks are now part of the page." if loose else ""))
             self.area.queue_draw()
 
         # ---- signing: draw it once, place it on any page ------------------------
         def sign_file(self):
-            return Path(os.environ.get("PEN_NOTE_CONFIG") or Path.home() / ".config" / "pen-note") / "signature.json"
+            return config_dir() / "signature.json"
 
         def on_sign(self, *_):
             try:
@@ -2047,11 +2204,127 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         def on_save_pdf(self, *_):
             self.ask_pdf_path(None)
 
-        def ask_pdf_path(self, only):
+        def on_create_certificate(self, made):
+            """A small form that makes a personal signing certificate; made(path) is called with its file."""
+            dlg = Gtk.Window(title="Create my certificate", transient_for=self.win, modal=True, default_width=380)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                          margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+            msg = Gtk.Label(xalign=0, wrap=True, label="Your name is what people see as the signer. The password protects "
+                                                      "the certificate file, so only you can sign with it.")
+            name = Gtk.Entry(placeholder_text="Your full name")
+            email = Gtk.Entry(placeholder_text="Email (optional)")
+            pw = Gtk.PasswordEntry(show_peek_icon=True)
+            pw.set_property("placeholder-text", "Choose a password")
+            row = Gtk.Box(spacing=6, halign=Gtk.Align.END)
+            cancel, ok = Gtk.Button(label="Cancel"), Gtk.Button(label="Create")
+            ok.add_css_class("suggested-action")
+            row.append(cancel)
+            row.append(ok)
+            for w in (msg, name, email, pw, row):
+                box.append(w)
+            dlg.set_child(box)
+
+            def go(*_):
+                if not name.get_text().strip() or len(pw.get_text()) < 4:
+                    msg.set_text("Type your name and a password of at least 4 characters.")
+                    return
+                path = config_dir() / "my-certificate.p12"
+                try:
+                    make_certificate(name.get_text().strip(), email.get_text().strip(), pw.get_text(), path)
+                except Exception as e:  # noqa: BLE001
+                    msg.set_text(f"Could not create it: {e}")
+                    return
+                dlg.close()
+                made(str(path), pw.get_text())
+            ok.connect("clicked", go)
+            cancel.connect("clicked", lambda *_: dlg.close())
+            dlg.present()
+
+        def on_sign_digitally(self, *_):
+            if not (self.strokes or self.items):
+                self.status.set_text("Nothing to sign yet. Open a PDF first.")
+                return
+            try:
+                from pyhanko.sign import signers  # noqa: F401
+            except ImportError:
+                self.status.set_text("Digital signing needs pyhanko: run  pip install --user pyhanko")
+                return
+            cfg = config_dir()
+            try:
+                last = json.loads((cfg / "signing.json").read_text()).get("p12")
+            except (OSError, ValueError):
+                last = None
+            mine = cfg / "my-certificate.p12"
+            state = {"p12": last if last and Path(last).exists() else (str(mine) if mine.exists() else None)}
+            dlg = Gtk.Window(title="Sign digitally", transient_for=self.win, modal=True, default_width=460)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                          margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+            info = Gtk.Label(xalign=0, wrap=True, label=(
+                "A digital signature locks the PDF: anyone can check who signed it and that nothing changed afterwards.\n\n"
+                "A certificate you create here proves the file was not changed, but programs like Adobe Reader will say the "
+                "signer is not verified. For legal weight, choose a certificate file from a trusted provider."))
+            cert_label = Gtk.Label(xalign=0, wrap=True)
+            buttons = Gtk.Box(spacing=6)
+            choose, create = Gtk.Button(label="Choose certificate file…"), Gtk.Button(label="Create my own…")
+            buttons.append(choose)
+            buttons.append(create)
+            pw = Gtk.PasswordEntry(show_peek_icon=True)
+            pw.set_property("placeholder-text", "Certificate password")
+            reason = Gtk.Entry(placeholder_text="Reason (optional), for example: I approve this")
+            msg = Gtk.Label(xalign=0, wrap=True)
+            row = Gtk.Box(spacing=6, halign=Gtk.Align.END)
+            cancel, go = Gtk.Button(label="Cancel"), Gtk.Button(label="Sign and save…")
+            go.add_css_class("suggested-action")
+            row.append(cancel)
+            row.append(go)
+            for w in (info, cert_label, buttons, pw, reason, msg, row):
+                box.append(w)
+            dlg.set_child(box)
+
+            def show_cert():
+                cert_label.set_text(f"Certificate: {Path(state['p12']).name}" if state["p12"] else "No certificate chosen yet.")
+            show_cert()
+
+            def chosen(path):
+                state["p12"] = path
+                show_cert()
+                dlg.present()
+            choose.connect("clicked", lambda *_: self.pick_file("Choose your certificate", "Certificate", [".p12", ".pfx"], chosen))
+
+            def made(path, password):
+                state["p12"] = path
+                pw.set_text(password)
+                show_cert()
+                msg.set_text("Certificate created.")
+            create.connect("clicked", lambda *_: self.on_create_certificate(made))
+
+            def sign(*_):
+                if not state["p12"]:
+                    msg.set_text("Choose or create a certificate first.")
+                    return
+                try:
+                    load_signer(state["p12"], pw.get_text())
+                except Exception:  # noqa: BLE001
+                    msg.set_text("That password doesn't open this certificate.")
+                    return
+                try:
+                    cfg.mkdir(parents=True, exist_ok=True)
+                    (cfg / "signing.json").write_text(json.dumps({"p12": state["p12"]}))
+                except OSError:
+                    pass
+                dlg.close()
+                self.ask_pdf_path(None, sign={"p12": state["p12"], "password": pw.get_text(),
+                                              "reason": reason.get_text().strip()})
+            go.connect("clicked", sign)
+            cancel.connect("clicked", lambda *_: dlg.close())
+            dlg.present()
+
+        def ask_pdf_path(self, only, sign=None):
             if not (self.strokes or self.items):
                 self.status.set_text("Nothing to save yet.")
                 return
-            dlg = Gtk.FileDialog(title="Save as PDF" if not only else "Save the chosen pages as PDF")
+            dlg = Gtk.FileDialog(title="Save as PDF, digitally signed" if sign else
+                                 "Save as PDF" if not only else "Save the chosen pages as PDF")
             name = safe_name(self.name_entry.get_text()) or self.saved_base or "Pen note"
             dlg.set_initial_name(f"{name}{'' if not only else ' (part)'}.pdf")
             if NOTES_DIR.is_dir():
@@ -2065,9 +2338,13 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 path = Path(f.get_path())
                 if path.suffix.lower() != ".pdf":
                     path = path.with_name(path.name + ".pdf")
+                if sign:
+                    return self.save_signed(path, only, sign)
                 try:
                     r = self.export_pdf(path, only)
                     msg = f"Saved PDF: {path}"
+                    if r["protected"]:
+                        msg += ". Locked with the same password as the original."
                     if r["covers"] and not r["left"]:
                         msg += ". The text you edited is removed from the file, not just hidden."
                     elif r["left"]:
@@ -2086,6 +2363,27 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         def item_centre(self, it):
             x, y, w, h = self.item_box(it)
             return x + w / 2, y + h / 2
+
+        def save_signed(self, path, only, sign):
+            unsigned = path.with_name(path.name + ".unsigned")
+            try:
+                r = self.export_pdf(unsigned, only, protect=False)
+                stamp = r["sign_rects"][0] if r["sign_rects"] else None
+                who = sign_pdf(unsigned, path, sign["p12"], sign["password"], stamp, sign["reason"])
+                intact = check_signature(path)
+            except Exception as e:  # noqa: BLE001
+                log("signing failed:", e)
+                self.status.set_text(f"Signing failed: {e}")
+                return
+            finally:
+                unsigned.unlink(missing_ok=True)
+            msg = f"Saved PDF signed by {who['name']}: {path}. " + (
+                "The signature is intact: any later change will show." if intact else "WARNING: the signature check failed.")
+            if who["self_signed"]:
+                msg += " Viewers will say the signer isn't verified, because this certificate is self-made."
+            if self.pdf_passwords:
+                msg += " This copy has no password (a signed file can't be locked afterwards)."
+            self.status.set_text(msg)
 
         def marks_in(self, rect):
             """True if any stroke or text sits on the rectangle (so a PDF page needs an overlay)."""
@@ -2166,7 +2464,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 ctx.restore()
             ctx.restore()
 
-        def export_pdf(self, path, only=None):
+        def export_pdf(self, path, only=None, protect=True):
             """Opened PDF pages are kept as they are (text stays real text) with the marks laid on
             top. With no PDF open, the whole surface becomes one page. `only` = page numbers to keep."""
             import cairo
@@ -2176,7 +2474,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return self.export_canvas_pdf(path)
             if only:
                 pages = [pages[n - 1] for n in only]
-            readers, writer, probe, checks = {}, PdfWriter(), PdfWriter(), []
+            readers, writer, probe, checks, sign_rects = {}, PdfWriter(), PdfWriter(), [], []
             for it in pages:
                 src, idx = it.pdf
                 if src not in readers:
@@ -2199,6 +2497,16 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     probe.add_page(page)                           # a copy as it is now: old text out, nothing on top yet
                     checks.append((len(probe.pages),
                                    [((c.x - box[0]) * k, (c.y - box[1]) * k, c.width * k, c.size * k) for c in covers]))
+                signs = [i for i in self.items if i.kind == "sign"
+                         and box[0] <= self.item_centre(i)[0] <= box[0] + box[2]
+                         and box[1] <= self.item_centre(i)[1] <= box[1] + box[3]]
+                if signs and not sign_rects:                       # a digital signature's note goes under the ink
+                    sx, sy, sw, sh = self.item_box(signs[0])
+                    x0 = float(crop.left) + (sx - box[0]) * k
+                    top = float(crop.top) - (sy - box[1]) * k
+                    bottom, wide = top - sh * k, max(sw * k, 160.0)
+                    low, high = (bottom - 40, bottom - 2) if bottom - 40 >= float(crop.bottom) else (top + 2, top + 40)
+                    sign_rects.append((len(writer.pages) - 1, (x0, low, x0 + wide, high)))
                 if self.marks_in(box):
                     buf = io.BytesIO()
                     surf = cairo.PDFSurface(buf, float(media.width), float(media.height))
@@ -2209,11 +2517,15 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.draw_cairo(ctx, box, images=False)
                     surf.finish()
                     page.merge_page(PdfReader(io.BytesIO(buf.getvalue())).pages[0])
+            passwords = [self.pdf_passwords[it.pdf[0]] for it in pages if it.pdf[0] in self.pdf_passwords]
+            if protect and passwords:                              # the original was locked: lock the result the same way
+                writer.encrypt(passwords[0], algorithm="AES-256")
             tmp = f"{path}.tmp"
             with open(tmp, "wb") as f:
                 writer.write(f)
             os.replace(tmp, path)
-            result = {"covers": sum(len(r) for _, r in checks), "left": 0}
+            result = {"covers": sum(len(r) for _, r in checks), "left": 0,
+                      "protected": bool(protect and passwords), "sign_rects": sign_rects}
             if checks:                                             # is any of the old text still in those pages?
                 tmp_probe = f"{path}.probe"
                 with open(tmp_probe, "wb") as f:
@@ -2243,7 +2555,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.draw_cairo(ctx, (bx, by, bw, bh), images=True)
             surf.finish()
             os.replace(tmp, path)
-            return {"covers": 0, "left": 0}
+            return {"covers": 0, "left": 0, "protected": False, "sign_rects": []}
 
         # ---- saving and opening ------------------------------------------------
         def has_content(self):

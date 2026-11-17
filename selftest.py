@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import struct
 import time
+from pathlib import Path
 
 import gi
 gi.require_version("Gdk", "4.0")
@@ -248,6 +249,114 @@ def run(self):
             return False
         win.fullscreen()
         GLib.timeout_add(1500, check_full)
+        return False
+    if mode == "dialogs":
+        os.environ["PEN_NOTE_CONFIG"] = tempfile.mkdtemp()
+        self.commit_text(None, (50, 50), "something to sign")
+        before = len(Gtk.Window.list_toplevels())
+        self.ask_password("/tmp/x.pdf", "x.pdf", None, True)
+        self.on_create_certificate(lambda *a: None)
+        self.on_sign_digitally()
+        opened = len(Gtk.Window.list_toplevels()) - before
+        log("selftest dialogs: password, certificate and signing windows all opened:", opened == 3, "(%d)" % opened)
+        for w in list(Gtk.Window.list_toplevels()):
+            if w is not self.win:
+                w.close()
+        self.win.close()
+        return False
+    if mode == "pdfsecure":
+        import cairo
+        from pypdf import PdfReader, PdfWriter
+        from pen_note import PasswordNeeded, check_signature, convert_slides, make_certificate, sign_pdf
+        d = tempfile.mkdtemp()
+        os.environ["PEN_NOTE_CONFIG"] = f"{d}/cfg"               # never touch the real saved signature or certificate
+        raw, locked = f"{d}/raw.pdf", f"{d}/locked.pdf"
+        surf = cairo.PDFSurface(raw, 595, 842)
+        c = cairo.Context(surf)
+        for n in (1, 2):
+            c.set_font_size(40)
+            c.move_to(80, 200)
+            c.show_text(f"Secret page {n}")
+            surf.show_page()
+        surf.finish()
+        wr = PdfWriter(clone_from=raw)
+        wr.encrypt("hunter2", algorithm="AES-256")
+        with open(locked, "wb") as f:
+            wr.write(f)
+        asked = wrong = None
+        try:
+            convert_slides(locked)
+        except PasswordNeeded as e:
+            asked = e.wrong
+        try:
+            convert_slides(locked, password="nope")
+        except PasswordNeeded as e:
+            wrong = e.wrong
+        log("selftest password: asks when none is given:", asked is False, "| says so when it is wrong:", wrong is True)
+
+        def after():
+            pages = self.pdf_pages()
+            log("selftest password: the right password opens both pages:", len(pages) == 2,
+                "| remembered for saving:", all(p.pdf[0] in self.pdf_passwords for p in pages),
+                "| unlocked copy is marked to be cleared next start:", Path(pages[0].pdf[0]).name.startswith("prot-"))
+            self.set_mode("highlight")
+            bx, by, bw, bh = self.item_box(pages[0])
+            self.begin((bx + bw * 0.1) * self.zoom + self.ox, (by + bh * 0.25) * self.zoom + self.oy, 0.5, False)
+            self.extend((bx + bw * 0.6) * self.zoom + self.ox, (by + bh * 0.25) * self.zoom + self.oy, 0.5)
+            self.finish()
+            out = f"{d}/out.pdf"
+            res = self.export_pdf(out)
+            ro = PdfReader(out)
+            opened = ro.is_encrypted and ro.decrypt("hunter2") > 0
+            plain = subprocess.run(["pdftotext", out, "-"], capture_output=True, text=True)
+            log("selftest password: the saved copy is locked with the same password:",
+                res["protected"] and opened and "Secret page 1" in (ro.pages[0].extract_text() or ""),
+                "| unreadable without it:", plain.returncode != 0 or "Secret" not in plain.stdout)
+            self.selected = pages[0]
+            self.rotate_page()                                       # turning a page of a locked PDF still works
+            out2 = f"{d}/out2.pdf"
+            self.export_pdf(out2)
+            r2 = PdfReader(out2)
+            log("selftest password: turned page, still locked and readable with the password:",
+                r2.is_encrypted and r2.decrypt("hunter2") > 0 and len(r2.pages) == 2)
+
+            # digital signature
+            p12 = Path(d) / "cfg" / "my.p12"
+            make_certificate("Test Person", "t@example.com", "pw123", p12)
+            self.color = (0.08, 0.08, 0.08)
+            self.place_signature({"aspect": 0.3, "strokes": [{"width": 0.02, "pts": [[0, 0, 0.5], [0.5, 0.3, 0.5], [1, 0, 0.5]]}]})
+            sign_item = [i for i in self.items if i.kind == "sign"][0]
+            page = self.pdf_pages()[0]
+            px, py, pw_, ph_ = self.item_box(page)
+            sign_item.x, sign_item.y, sign_item.width = px + 0.2 * pw_, py + 0.5 * ph_, 0.3 * pw_
+            unsigned = f"{d}/u.pdf"
+            r = self.export_pdf(unsigned, protect=False)
+            signed = f"{d}/signed.pdf"
+            who = sign_pdf(unsigned, signed, p12, "pw123", r["sign_rects"][0] if r["sign_rects"] else None, "I agree")
+            log("selftest signature: a place was found under the drawn signature:", len(r["sign_rects"]) == 1,
+                "| signed by:", who["name"], "| self-made certificate noticed:", who["self_signed"])
+            info = subprocess.run(["pdfsig", signed], capture_output=True, text=True).stdout
+            log("selftest signature: genuine and intact:", check_signature(signed),
+                "| an independent tool (pdfsig) sees the signature:", "Signature Field Name" in info and "Test Person" in info)
+            data = bytearray(Path(signed).read_bytes())
+            at = data.find(b"%PDF-1.") + 7
+            data[at] = ord("6") if data[at] != ord("6") else ord("5")             # change one byte inside the signed part
+            Path(f"{d}/tampered.pdf").write_bytes(bytes(data))
+            try:
+                changed_caught = not check_signature(f"{d}/tampered.pdf")
+            except Exception:  # noqa: BLE001
+                changed_caught = True
+            log("selftest signature: a changed file is caught:", changed_caught)
+            try:
+                sign_pdf(unsigned, f"{d}/x.pdf", p12, "wrong", None)
+                bad = False
+            except Exception:  # noqa: BLE001
+                bad = True
+            log("selftest signature: wrong certificate password is refused:", bad)
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+
+        self.add_slide_file(locked, done=after, password="hunter2")
         return False
     if mode == "pdfform":
         # text inside an embedded form object can't be removed: the app must say it is only covered
