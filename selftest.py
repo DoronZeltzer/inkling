@@ -394,12 +394,13 @@ def run(self):
             self.win.close()
             return False
         wc, dc, gc = tools["wordcraft"], tools["deckcraft"], tools["gridcraft"]
-        (Path(d) / "t.html").write_text("<html><body><h1>Quarterly report</h1><p>The numbers went up.</p>"
+        token = str(time.time_ns())                                   # new files every run, so nothing comes from the cache
+        (Path(d) / "t.html").write_text(f"<html><body><h1>Quarterly report</h1><p>The numbers went up {token}.</p>"
                                         "<p dir='rtl'>שלום עולם</p></body></html>")
         subprocess.run([str(wc), "convert", f"{d}/t.html", f"{d}/report.docx"], capture_output=True, check=True)
-        subprocess.run([str(dc), "run", "--cmd", 'slide.new={"layout":"title","title":"Deck title","body":"deck body"}',
+        subprocess.run([str(dc), "run", "--cmd", 'slide.new={"layout":"title","title":"Deck title","body":"deck body ' + token + '"}',
                         "--save", f"{d}/deck.pptx"], capture_output=True, check=True)
-        (Path(d) / "s.csv").write_text("Name,Qty\nApple,3\nPear,5\n")
+        (Path(d) / "s.csv").write_text(f"Name,Qty\nApple,3\nPear,{token}\n")
         subprocess.run([str(gc), "convert", f"{d}/s.csv", f"{d}/sheet.xlsx"], capture_output=True, check=True)
         files = [(f"{d}/report.docx", "WordCraft", "Quarterly report"), (f"{d}/deck.pptx", "DeckCraft", "Deck title"),
                  (f"{d}/sheet.xlsx", "GridCraft", "Apple"), (f"{d}/s.csv", "GridCraft", "Pear")]
@@ -417,9 +418,22 @@ def run(self):
                 log(f"selftest apps: {Path(path).name} opened by {who} in its own tab:", len(pages) >= 1 and word in text
                     and who in self.status.get_text() and self.cur.source == path,
                     "| pages:", len(pages))
+                icon = self.tab_buttons[self.cur].get_child().get_first_child()
+                log(f"selftest apps: its tab shows {who}'s icon:", isinstance(icon, Gtk.Image)
+                    and icon.get_icon_name() == f"ai.storyteller.{who.lower()}")
                 if path.endswith(".docx"):
-                    log("selftest apps: 'Open in WordCraft' is offered for it:", self.open_in.get_visible()
-                        and "WordCraft" in self.open_in.get_label(), "| Hebrew arrived:", "שלום" in text)
+                    log("selftest apps: 'Open in WordCraft' is offered for it, with the icon:", self.open_in_icon.get_icon_name() == "ai.storyteller.wordcraft", self.open_in.get_visible()
+                        and "WordCraft" in self.open_in_label.get_text(), "| Hebrew arrived:", "שלום" in text)
+                if path.endswith(".pptx"):                                    # again, now from the cache: still says which app
+                    self.close_tab(self.cur)
+                    self.msgs.clear()
+
+                    def again():
+                        log("selftest apps: reopened from the cache, it still says DeckCraft did it:",
+                            "DeckCraft" in self.status.get_text() and any("cache" in m for m in self.msgs))
+                        next_file()
+                    self.add_slide_file(path, done=again)
+                    return
                 next_file()
             self.add_slide_file(path, done=opened)
 
@@ -521,6 +535,41 @@ def run(self):
             next_one()
         self.add_slide_file(src, done=opened)
         return False
+    if mode == "look3":
+        # not a check: a picture of the side panel with one tab of each kind ($INKLING_LOOK-icons.png)
+        import cairo
+        from inkling import find_office_tool
+        d = tempfile.mkdtemp()
+        os.environ["INKLING_CONFIG"] = f"{d}/cfg"
+        wc, dc, gc = (find_office_tool(n) for n in ("wordcraft", "deckcraft", "gridcraft"))
+        (Path(d) / "t.html").write_text("<html><body><h1>Report</h1><p>Text.</p></body></html>")
+        subprocess.run([str(wc), "convert", f"{d}/t.html", f"{d}/Report.docx"], capture_output=True)
+        subprocess.run([str(dc), "run", "--cmd", 'slide.new={"title":"Deck"}', "--save", f"{d}/Deck.pptx"], capture_output=True)
+        (Path(d) / "s.csv").write_text("a,b\n1,2\n")
+        subprocess.run([str(gc), "convert", f"{d}/s.csv", f"{d}/Budget.xlsx"], capture_output=True)
+        surf = cairo.PDFSurface(f"{d}/Contract.pdf", 595, 842)
+        surf.show_page()
+        surf.finish()
+        todo = [f"{d}/Report.docx", f"{d}/Deck.pptx", f"{d}/Budget.xlsx", f"{d}/Contract.pdf"]
+
+        def shot():
+            w, h = self.win.get_width(), self.win.get_height()
+            paint = Gtk.WidgetPaintable.new(self.win)
+            s = Gtk.Snapshot()
+            paint.snapshot(s, w, h)
+            tex = self.get_renderer().render_texture(s.to_node(), Graphene.Rect().init(0, 0, w, h))
+            tex.save_to_png(os.environ["INKLING_LOOK"] + "-icons.png")
+            self.win.close()
+            return False
+
+        def nxt():
+            if todo:
+                self.add_slide_file(todo.pop(0), done=nxt)
+            else:
+                self.switch_to(self.docs[0])
+                GLib.timeout_add(700, shot)
+        nxt()
+        return False
     if mode == "look2":
         # not a check: pictures of the window with several tabs, the panel open and then collapsed
         import cairo
@@ -581,7 +630,7 @@ def run(self):
                 and self.doc_title(self.cur) == "a" and pages() == 2)
             line(100, 100, 300, 150)
             self.set_view(0.7, 20, 30)
-            log("selftest tabs: drawing marks the tab as unsaved (a dot):", self.tab_buttons[self.cur].get_label().startswith("•"))
+            log("selftest tabs: drawing marks the tab as unsaved (a dot):", self.tab_labels[self.cur].get_text().startswith("•"))
             self.add_slide_file(files["b"], done=after_b)
 
         def after_b():

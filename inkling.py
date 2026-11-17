@@ -585,6 +585,14 @@ OFFICE_APPS = {
     "gridcraft": ("GridCraft", {".xlsx", ".csv", ".tsv"}),
 }
 TOOL_CACHE = Path.home() / ".cache" / "inkling" / "tools"
+APP_ICONS = tuple(f"ai.storyteller.{n}" for n in OFFICE_APPS)      # the icons the apps ship under
+
+
+def doc_icon(source):
+    """The icon for a tab: the app that opened the file, a PDF icon, or Inkling's own."""
+    ext = Path(source).suffix.lower() if source else ""
+    app = office_app_for(ext)
+    return f"ai.storyteller.{app}" if app else "application-pdf" if ext == ".pdf" else "inkling"
 _tool_lock = threading.Lock()
 OPENED_WITH = {}      # file -> the app that opened it, for the message when it is ready
 
@@ -766,6 +774,10 @@ def convert_slides(path, progress=lambda text: None, on_page=None, password=None
         elif pdf_store.exists():                         # converted before: instant
             progress("Found this deck in the cache")
             os.utime(pdf_store)
+            try:                                         # which app made it, remembered when it was converted
+                OPENED_WITH[str(path)] = pdf_store.with_suffix(".app").read_text()
+            except OSError:
+                pass
         else:
             WORK_DIR.mkdir(exist_ok=True)
             PDF_STORE.mkdir(parents=True, exist_ok=True)
@@ -781,6 +793,8 @@ def convert_slides(path, progress=lambda text: None, on_page=None, password=None
                 tmp = pdf_store.with_suffix(".tmp")
                 shutil.copyfile(pdf, tmp)
                 os.replace(tmp, pdf_store)
+                if str(path) in OPENED_WITH:
+                    pdf_store.with_suffix(".app").write_text(OPENED_WITH[str(path)])
             except subprocess.TimeoutExpired:
                 raise RuntimeError("conversion took too long (over 5 minutes)") from None
             finally:
@@ -1087,6 +1101,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.cur = Doc()          # the tab you are looking at (its state lives in the attributes below)
             self.docs = [self.cur]    # all tabs, in the order of the list on the left
             self.tab_buttons = {}     # tab -> its button in the list
+            self.tab_labels = {}      # tab -> the text on that button
             self.tex_cache = OrderedDict()   # (pdf, page) -> picture of that page, newest last
             self.tex_pending = set()         # pages being drawn right now
             self.tex_failed = set()
@@ -1217,9 +1232,12 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                             margin_start=6, margin_end=6)
             export_items = []
             for fmt, label in EXPORT_FORMATS:
-                item = Gtk.Button(label=label)
+                app = EXPORT_INFO[fmt][1]
+                item = Gtk.Button()
                 item.add_css_class("flat")
-                item.get_child().set_halign(Gtk.Align.START)
+                item.set_child(self.icon_label(label, f"ai.storyteller.{app}" if app else
+                                               {"pdf": "application-pdf", "txt": "text-x-generic",
+                                                "png": "image-x-generic"}[fmt])[0])
                 item.connect("clicked", lambda _b, f=fmt: (popover.popdown(), self.export_as(f)))
                 plist.append(item)
                 export_items.append((fmt, item))
@@ -1412,6 +1430,21 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             width = min(720.0, 480.0 * tw / max(th, 1))
             self.items.append(Item("image", 40.0, 40.0, width=width, texture=tex, auto=True))
 
+        def icon_label(self, text, icons=(), max_chars=None):
+            """A box with small icons (the ones the icon theme has) in front of a label, to put inside a button."""
+            theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+            box = Gtk.Box(spacing=6)
+            for name in ([icons] if isinstance(icons, str) else icons):
+                if name and theme.has_icon(name):
+                    img = Gtk.Image.new_from_icon_name(name)
+                    img.set_pixel_size(16)
+                    box.append(img)
+            lab = Gtk.Label(label=text, xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+            if max_chars:
+                lab.set_max_width_chars(max_chars)
+            box.append(lab)
+            return box, lab
+
         # ---- tabs: each opened document has its own ---------------------------------
         def stash(self):
             """Copy the live state into the current tab, so it can be left and come back unchanged."""
@@ -1539,18 +1572,16 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.stash()
             while (child := box.get_first_child()) is not None:
                 box.remove(child)
-            self.tab_buttons = {}
+            self.tab_buttons, self.tab_labels = {}, {}
             for doc in self.docs:
                 row = Gtk.Box(spacing=2)
                 if doc is self.cur:
                     row.add_css_class("inkling-tab-active")
                 title = self.doc_title(doc)
-                b = Gtk.Button(label=("• " if doc.dirty else "") + title, hexpand=True)
+                b = Gtk.Button(hexpand=True)
                 b.add_css_class("flat")
-                lab = b.get_child()
-                lab.set_halign(Gtk.Align.START)
-                lab.set_ellipsize(Pango.EllipsizeMode.END)
-                lab.set_max_width_chars(17)
+                content, lab = self.icon_label(("• " if doc.dirty else "") + title, doc_icon(doc.source), 15)
+                b.set_child(content)
                 b.set_tooltip_text(Path(doc.source).name if doc.source else title)
                 b.connect("clicked", lambda _b, d=doc: self.switch_to(d))
                 x = Gtk.Button(label="×")
@@ -1560,13 +1591,14 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 row.append(b)
                 row.append(x)
                 box.append(row)
-                self.tab_buttons[doc] = b
+                self.tab_buttons[doc], self.tab_labels[doc] = b, lab
             src = self.cur.source
             app = office_app_for(Path(src).suffix.lower()) if src else None
             show = bool(app) and office_available(app)
             self.open_in.set_visible(show)
             if show:
-                self.open_in.set_label(f"Open in {OFFICE_APPS[app][0]}")
+                self.open_in_label.set_text(f"Open in {OFFICE_APPS[app][0]}")
+                self.open_in_icon.set_from_icon_name(f"ai.storyteller.{app}")
                 self.open_in.set_tooltip_text("Open the original file in the app that edits it")
 
         # ---- selection ---------------------------------------------------------
@@ -1757,9 +1789,9 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             del self.undo_stack[:-50]
             self.redo_stack.clear()  # a new action ends the redo history
             if not self.dirty:
-                b = self.tab_buttons.get(self.cur)
-                if b is not None:
-                    b.set_label("• " + self.doc_title(self.cur))
+                lab = self.tab_labels.get(self.cur)
+                if lab is not None:
+                    lab.set_text("• " + self.doc_title(self.cur))
             self.dirty = True
 
         def on_undo(self, *_):
@@ -1958,11 +1990,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 lab.add_css_class("caption-heading")
                 side.append(lab)
 
-            def button(label, cb, tip=None):
-                b = Gtk.Button(label=label)
+            def button(label, cb, tip=None, icons=()):
+                b = Gtk.Button()
                 b.add_css_class("flat")
-                b.get_child().set_halign(Gtk.Align.START)
-                b.get_child().set_ellipsize(Pango.EllipsizeMode.END)     # a narrow panel cuts the words, not the layout
+                b.set_child(self.icon_label(label, icons)[0])         # a narrow panel cuts the words, not the layout
                 b.connect("clicked", cb)
                 if tip:
                     b.set_tooltip_text(tip)
@@ -1972,10 +2003,14 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.tabs_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             side.append(self.tabs_box)
             button("+ New note", self.on_new_tab, "A blank note in its own tab")
-            self.open_in = Gtk.Button(label="")
+            self.open_in = Gtk.Button()
             self.open_in.add_css_class("flat")
-            self.open_in.get_child().set_halign(Gtk.Align.START)
-            self.open_in.get_child().set_ellipsize(Pango.EllipsizeMode.END)
+            open_box = Gtk.Box(spacing=6)
+            self.open_in_icon = Gtk.Image(pixel_size=16)
+            self.open_in_label = Gtk.Label(label="", xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+            open_box.append(self.open_in_icon)
+            open_box.append(self.open_in_label)
+            self.open_in.set_child(open_box)
             self.open_in.connect("clicked", self.open_in_app)
             self.open_in.set_visible(False)
             side.append(self.open_in)
@@ -1987,15 +2022,16 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.tab_css,
                                                       Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             head("OPEN (each in its own tab)")
-            button("Note…", self.on_open, "A note you saved before, to continue it")
+            button("Note…", self.on_open, "A note you saved before, to continue it", icons="inkling")
             button("PDF…", lambda *_: self.pick_file("Open a PDF", "PDF", [".pdf"], self.add_slide_file),
-                   "Open a PDF: write on it, highlight, then Export")
-            button("Word, slides, Excel…", lambda *_: self.pick_file(
+                   "Open a PDF: write on it, highlight, then Export", icons="application-pdf")
+            button("Office file…", lambda *_: self.pick_file(
                 "Open a Word, PowerPoint, Excel or OpenDocument file", "Office files", sorted(OFFICE_EXTS),
-                self.add_slide_file), "Opened by the app on this computer that handles it (WordCraft, DeckCraft, GridCraft): every page becomes a PDF page")
+                self.add_slide_file), "Opened by the app on this computer that handles it (WordCraft, DeckCraft, GridCraft): every page becomes a PDF page",
+                   icons=APP_ICONS)
             button("Picture…", lambda *_: self.pick_file(
                 "Add a picture", "Pictures", [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"], self.add_picture_file),
-                "Adds a picture to the tab you are in")
+                "Adds a picture to the tab you are in", icons="image-x-generic")
             head("PDF PAGES")
             button("Join another PDF…", lambda *_: self.pick_file(
                 "Add a PDF to this one", "PDF", [".pdf"], lambda p: self.add_slide_file(p, new_tab=False)),
