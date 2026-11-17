@@ -29,7 +29,9 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import zipfile
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -233,15 +235,14 @@ SLIDE_EXTS = {".pptx", ".ppt", ".pps", ".ppsx", ".odp", ".pdf"}
 SLIDE_RENDER_WIDTH = 1400   # pixels per slide picture
 SLIDE_DISPLAY_WIDTH = 900   # world pixels per slide on the surface
 SLIDE_GAP_RATIO = 0.6       # blank space after each slide, as a fraction of the slide's height
-MAX_SLIDES = 150
+MAX_SLIDES = 2000
 # The snap-packaged LibreOffice can only read non-hidden folders inside your home folder,
 # so decks are copied into this work folder (and removed again) for conversion.
 WORK_DIR = SELF.parent / "work"
-# Converted decks are kept here, so adding the same file again is instant.
-CACHE_DIR = Path(os.environ.get("PEN_NOTE_CACHE") or WORK_DIR / "cache")
-CACHE_LIMIT = 500 * 1024 * 1024    # bytes
-# The PDF behind every page picture (a converted deck, an opened PDF, a rotated copy). Kept apart
-# from the cache so pruning can never remove a file an open note still needs.
+EXPORT_MAX_PAGES = 40       # PDF pages drawn into the saved PNG preview (the rest show as grey boxes)
+PAGE_TEXTURES = 24          # PDF pages kept drawn in memory; the others are drawn again when you scroll back
+# The PDF behind every page (an opened PDF, a converted deck, a turned copy). A saved note carries its
+# own copy and brings it back when opened, so copies not used for a while are cleared away.
 PDF_STORE = WORK_DIR / "pdf-src"
 
 
@@ -306,22 +307,136 @@ def parse_pages(text, total):
     return out
 
 
+BIDI_MARKS = set("\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def is_rtl(text):
+    """True if the first letter is from a right-to-left script (Hebrew, Arabic)."""
+    for ch in text:
+        kind = unicodedata.bidirectional(ch)
+        if kind in ("R", "AL"):
+            return True
+        if kind == "L":
+            return False
+    return False
+
+
 def pdf_text_lines(pdf, n):
     """(page width, page height, [(text, x0, y0, x1, y1)]) for page n (1-based), in points from the
     top-left of the crop box. No lines for a scanned page (it has no text to pick)."""
-    out = subprocess.run(["pdftotext", "-bbox-layout", "-cropbox", "-f", str(n), "-l", str(n), str(pdf), "-"],
-                         capture_output=True, text=True, timeout=60).stdout
+    def run(*args):
+        return subprocess.run(["pdftotext", *args, "-cropbox", "-f", str(n), "-l", str(n), str(pdf), "-"],
+                              capture_output=True, text=True, timeout=60).stdout
+    out = run("-bbox-layout")
     size = re.search(r'<page width="([\d.]+)" height="([\d.]+)"', out)
     if not size:
         return 0.0, 0.0, []
+    # Right-to-left text comes out of the box mode with every word's letters reversed. The plain mode
+    # gives it in reading order, so those lines are found again by their letters and used instead.
+    plain = [" ".join("".join(ch for ch in ln if ch not in BIDI_MARKS).split()) for ln in run().splitlines()]
+    pool = [(ln, sorted(c for c in ln if not c.isspace())) for ln in plain if ln]
     lines = []
     for m in re.finditer(r'<line xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">(.*?)</line>',
                          out, re.S):
         words = re.findall(r"<word[^>]*>(.*?)</word>", m.group(5), re.S)
         text = html.unescape(" ".join(words)).strip()
-        if text:
-            lines.append((text, *map(float, m.groups()[:4])))
+        if not text:
+            continue
+        if any(unicodedata.bidirectional(ch) in ("R", "AL") for ch in text):
+            letters = sorted(c for c in text if not c.isspace())
+            for k, (ln, ln_letters) in enumerate(pool):
+                if ln_letters == letters:
+                    text = ln
+                    del pool[k]
+                    break
+        lines.append((text, *map(float, m.groups()[:4])))
     return float(size.group(1)), float(size.group(2)), lines
+
+
+def page_ratio(page):
+    """Height over width of a PDF page as a viewer shows it (crop box, turned)."""
+    box = page.cropbox
+    w, h = float(box.width), float(box.height)
+    if page.rotation % 180:
+        w, h = h, w
+    return h / w
+
+
+def migrate_page(it, old_ratio=None):
+    """Set a page's proportions from its PDF. A note saved while page pictures still showed the whole
+    media box (old_ratio = that picture's height/width) is lined up with the crop box instead."""
+    from pypdf import PdfReader
+    page = PdfReader(it.pdf[0]).pages[it.pdf[1]]
+    it.ratio = page_ratio(page)
+    if old_ratio is None or abs(it.ratio - old_ratio) < 0.002 or page.rotation % 360:
+        return
+    media, crop = page.mediabox, page.cropbox
+    k = it.width / float(media.width)
+    it.x += float(crop.left - media.left) * k
+    it.y += float(media.top - crop.top) * k
+    it.width = float(crop.width) * k
+
+
+def strip_text_in_rects(page, rects):
+    """Delete from a page the text drawn inside the rectangles (x0, y0, x1, y1 in the page's own units,
+    y up): the text-drawing operations whose starting point is inside one. Returns how many were removed.
+    Text kept inside embedded form objects is left alone."""
+    from pypdf.generic import ArrayObject, ByteStringObject
+    content = page.get_contents()
+    if content is None:
+        return 0
+    ident = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+    def mul(m, n):
+        return (m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3], m[2] * n[0] + m[3] * n[2],
+                m[2] * n[1] + m[3] * n[3], m[4] * n[0] + m[5] * n[2] + n[4], m[4] * n[1] + m[5] * n[3] + n[5])
+
+    def inside(x, y):
+        return any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in rects)
+
+    ctm, stack, tm, tlm, lead, removed = ident, [], ident, ident, 0.0, 0
+    for operands, op in content.operations:
+        try:
+            if op == b"q":
+                stack.append(ctm)
+            elif op == b"Q":
+                ctm = stack.pop() if stack else ident
+            elif op == b"cm":
+                ctm = mul(tuple(float(v) for v in operands), ctm)
+            elif op == b"BT":
+                tm = tlm = ident
+            elif op == b"Tm":
+                tm = tlm = tuple(float(v) for v in operands)
+            elif op in (b"Td", b"TD"):
+                if op == b"TD":
+                    lead = -float(operands[1])
+                tlm = mul((1.0, 0.0, 0.0, 1.0, float(operands[0]), float(operands[1])), tlm)
+                tm = tlm
+            elif op == b"TL":
+                lead = float(operands[0])
+            elif op in (b"T*", b"'", b'"'):
+                tlm = mul((1.0, 0.0, 0.0, 1.0, 0.0, -lead), tlm)
+                tm = tlm
+            if op in (b"Tj", b"TJ", b"'", b'"'):
+                x, y = mul(tm, ctm)[4:]
+                if inside(x, y):
+                    operands[-1] = ArrayObject() if op == b"TJ" else ByteStringObject(b"")
+                    removed += 1
+        except (ValueError, IndexError, TypeError):
+            continue
+    if removed:
+        page.replace_contents(content)
+    return removed
+
+
+def prune_pdf_store(days=14):
+    cutoff = time.time() - days * 86400
+    try:
+        for f in PDF_STORE.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def render_pdf_page(pdf, n):
@@ -377,133 +492,98 @@ def file_sha1(path):
     return h.hexdigest()
 
 
-def prune_cache():
-    """Keep the cache under CACHE_LIMIT by deleting the least recently used decks."""
-    try:
-        decks = [d for d in CACHE_DIR.iterdir() if d.is_dir()]
-        sizes = {d: sum(f.stat().st_size for f in d.iterdir()) for d in decks}
-        total = sum(sizes.values())
-        for d in sorted(decks, key=lambda d: d.stat().st_mtime):
-            if total <= CACHE_LIMIT:
-                break
-            total -= sizes[d]
-            shutil.rmtree(d, ignore_errors=True)
-    except OSError:
-        pass
-
-
 def convert_slides(path, progress=lambda text: None, on_page=None):
-    """Turn a PowerPoint/OpenDocument/PDF file into one PNG per slide.
+    """Turn a PowerPoint/OpenDocument/PDF file into PDF pages that can be laid out.
 
-    Slow for PowerPoint (LibreOffice needs most of a minute for a big deck), so call it off the UI
-    thread. `progress(text)` reports what it is doing and `on_page(number, total, png_bytes, pdf_path)` is
-    called for each slide, in order, as soon as that slide is ready (so slides can appear while the
-    rest are still rendering). Slides are rendered in parallel, and a deck that was converted before
-    comes straight from the cache. Returns the number of slides. Raises RuntimeError."""
+    A PDF is used as it is; PowerPoint is slow (LibreOffice needs most of a minute for a big deck), so
+    call this off the UI thread. `progress(text)` reports what it is doing and
+    `on_page(number, total, ratio, pdf_path)` is called for each page, in order (ratio = height / width).
+    The pages themselves are drawn later, as they come into view. A file that was converted before
+    comes straight from the store. Returns the number of pages. Raises RuntimeError."""
     path = Path(path)
     ext = path.suffix.lower()
     if ext not in SLIDE_EXTS:
         raise RuntimeError("that isn't a PowerPoint, OpenDocument or PDF file")
-    key = f"{file_sha1(path)}-{SLIDE_RENDER_WIDTH}c"      # "c": pictures show the crop box, like viewers
-    cache = CACHE_DIR / key
-    pdf_store = PDF_STORE / f"{key}.pdf"
+    pdf_store = PDF_STORE / f"{file_sha1(path)}.pdf"
     if _convert_lock.locked():
         progress("Waiting for the other deck to finish…")
     with _convert_lock:
-        done_marker = cache / "complete"
-        if done_marker.exists() and pdf_store.exists():  # converted before: instant
-            total = int(done_marker.read_text())
+        if pdf_store.exists():                           # converted before: instant
             progress("Found this deck in the cache")
-            for i in range(1, total + 1):
-                if on_page:
-                    on_page(i, total, (cache / f"p-{i:03d}.png").read_bytes(), str(pdf_store))
-            os.utime(cache)                              # most recently used
-            return total
-
-        shutil.rmtree(cache, ignore_errors=True)
-        cache.mkdir(parents=True)
-        WORK_DIR.mkdir(exist_ok=True)
-        job = Path(tempfile.mkdtemp(prefix="job-", dir=WORK_DIR))
-        pool = None
-        try:
-            src = job / f"deck{ext}"
-            shutil.copyfile(path, src)
-            if ext == ".pdf":
-                pdf = src
-            else:
-                office = shutil.which("libreoffice") or shutil.which("soffice")
-                if not office:
-                    raise RuntimeError("LibreOffice isn't installed; export the slides as a PDF and add that instead")
-                progress("Converting with LibreOffice… a big deck can take a minute (a PDF is much faster)")
-                profile = WORK_DIR / "lo-profile"   # own profile: works even while LibreOffice is open
-                r = subprocess.run(
-                    [office, f"-env:UserInstallation={profile.as_uri()}", "--headless",
-                     "--convert-to", "pdf", "--outdir", str(job), str(src)],
-                    capture_output=True, text=True, timeout=300)
-                pdf = job / "deck.pdf"
-                if not pdf.exists():
-                    detail = (r.stdout + r.stderr).strip()[-160:]
-                    raise RuntimeError("LibreOffice could not convert it" + (f": {detail}" if detail else
-                                       " (it returned nothing; is another LibreOffice job running?)"))
-            info = subprocess.run(["pdfinfo", str(pdf)], capture_output=True, text=True)
-            m = re.search(r"Pages:\s+(\d+)", info.stdout)
-            total = min(int(m.group(1)), MAX_SLIDES) if m else 0
-            if total == 0:
-                raise RuntimeError("no pages found: " + (info.stderr.strip()[-160:] or "empty file?"))
-
-            def render(i):
-                out = cache / f"p-{i:03d}"              # -singlefile writes exactly <out>.png
-                r = subprocess.run(
-                    ["pdftoppm", "-png", "-cropbox", "-singlefile", "-f", str(i), "-l", str(i),
-                     "-scale-to-x", str(SLIDE_RENDER_WIDTH), "-scale-to-y", "-1", str(pdf), str(out)],
-                    capture_output=True, text=True, timeout=300)
-                png = Path(str(out) + ".png")
-                if not png.exists():
-                    raise RuntimeError(f"could not render slide {i}: {r.stderr.strip()[-120:]}")
-                return png.read_bytes()
-
+            os.utime(pdf_store)
+        else:
+            WORK_DIR.mkdir(exist_ok=True)
             PDF_STORE.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(pdf, pdf_store)             # the page pictures point back to this PDF
-            progress(f"Rendering {total} slide{'s' if total != 1 else ''}…")
-            pool = ThreadPoolExecutor(max_workers=max(2, min(8, os.cpu_count() or 4)))
-            futures = [pool.submit(render, i) for i in range(1, total + 1)]
-            for i, fut in enumerate(futures, 1):         # hand over slides in order, as each is ready
-                data = fut.result()
-                if on_page:
-                    on_page(i, total, data, str(pdf_store))
-            done_marker.write_text(str(total))
-            prune_cache()
-            return total
-        except subprocess.TimeoutExpired:
-            shutil.rmtree(cache, ignore_errors=True)
-            raise RuntimeError("conversion took too long (over 5 minutes)")
-        except BaseException:
-            shutil.rmtree(cache, ignore_errors=True)    # never keep a half-finished deck
+            job = Path(tempfile.mkdtemp(prefix="job-", dir=WORK_DIR))
+            try:
+                src = job / f"deck{ext}"
+                shutil.copyfile(path, src)
+                if ext == ".pdf":
+                    pdf = src
+                else:
+                    office = shutil.which("libreoffice") or shutil.which("soffice")
+                    if not office:
+                        raise RuntimeError("LibreOffice isn't installed; export the slides as a PDF and add that instead")
+                    progress("Converting with LibreOffice… a big deck can take a minute (a PDF is much faster)")
+                    profile = WORK_DIR / "lo-profile"   # own profile: works even while LibreOffice is open
+                    r = subprocess.run(
+                        [office, f"-env:UserInstallation={profile.as_uri()}", "--headless",
+                         "--convert-to", "pdf", "--outdir", str(job), str(src)],
+                        capture_output=True, text=True, timeout=300)
+                    pdf = job / "deck.pdf"
+                    if not pdf.exists():
+                        detail = (r.stdout + r.stderr).strip()[-160:]
+                        raise RuntimeError("LibreOffice could not convert it" + (f": {detail}" if detail else
+                                           " (it returned nothing; is another LibreOffice job running?)"))
+                tmp = pdf_store.with_suffix(".tmp")
+                shutil.copyfile(pdf, tmp)
+                os.replace(tmp, pdf_store)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("conversion took too long (over 5 minutes)") from None
+            finally:
+                shutil.rmtree(job, ignore_errors=True)
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(pdf_store))
+            if reader.is_encrypted and not reader.decrypt(""):
+                raise RuntimeError("this PDF is password protected")
+            total = min(len(reader.pages), MAX_SLIDES)
+            ratios = [page_ratio(reader.pages[i]) for i in range(total)]
+        except RuntimeError:
+            pdf_store.unlink(missing_ok=True)
             raise
-        finally:
-            if pool:
-                pool.shutdown(wait=False, cancel_futures=True)
-            shutil.rmtree(job, ignore_errors=True)
+        except Exception as e:  # noqa: BLE001
+            pdf_store.unlink(missing_ok=True)
+            raise RuntimeError(f"no pages found: {str(e)[-120:] or 'empty file?'}") from None
+        if total == 0:
+            pdf_store.unlink(missing_ok=True)
+            raise RuntimeError("no pages found: empty file?")
+        progress(f"Opening {total} page{'s' if total != 1 else ''}…")
+        for i, ratio in enumerate(ratios, 1):
+            if on_page:
+                on_page(i, total, ratio, str(pdf_store))
+        return total
 
 
 class Item:
     """A picture or a text box. x, y, image width and text size are in world pixels
     (1 world pixel = 1 screen pixel at zoom 1)."""
-    __slots__ = ("kind", "x", "y", "width", "texture", "text", "size", "color", "png", "auto", "pdf", "sign")
+    __slots__ = ("kind", "x", "y", "width", "texture", "text", "size", "color", "png", "auto", "pdf", "sign", "ratio")
 
     def __init__(self, kind, x, y, width=400.0, texture=None, text="", size=24.0,
-                 color=(0.08, 0.08, 0.08), png=None, auto=False, pdf=None, sign=None):
+                 color=(0.08, 0.08, 0.08), png=None, auto=False, pdf=None, sign=None, ratio=None):
         self.kind, self.x, self.y = kind, x, y
         self.width, self.texture, self.text, self.size, self.color = width, texture, text, size, color
         self.png = png        # cached PNG bytes of the picture (for saving)
         self.auto = auto      # the screenshot placed automatically: doesn't count as "content"
         self.pdf = pdf        # (path of the PDF, page index) when this picture is a PDF page
+        self.ratio = ratio    # height / width of a PDF page (it has no picture until it is drawn)
         self.sign = sign      # a signature: {"aspect": h/w, "strokes": [{"width", "pts": [[u, v, p]]}]},
                               # points as fractions of the signature's width
 
     def clone(self):
         return Item(self.kind, self.x, self.y, self.width, self.texture, self.text, self.size,
-                    self.color, self.png, self.auto, self.pdf, self.sign)
+                    self.color, self.png, self.auto, self.pdf, self.sign, self.ratio)
 
 
 def run_canvas(screenshot, open_name=None, slides=None, files=()):
@@ -575,6 +655,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.signing = None       # while drawing a new signature: what the surface held before
             self.text_cover = None    # set while retyping a line of a PDF's own text
             self.line_cache = {}      # (pdf, page) -> its text lines
+            self.tex_cache = OrderedDict()   # (pdf, page) -> picture of that page, newest last
+            self.tex_pending = set()         # pages being drawn right now
+            self.tex_failed = set()
+            self.export_pages = set()
+            self.render_pool = ThreadPoolExecutor(max_workers=3)
             self.erase_snapped = False
             self.strokes = []
             self.items = []           # pictures and text boxes
@@ -650,8 +735,11 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             outer.append(root)
 
             def new_bar():
+                # in a scroller, so a long row of tools never makes the window wider than the screen
                 bar = Gtk.Box(spacing=6, margin_top=4, margin_bottom=2, margin_start=8, margin_end=8)
-                root.append(bar)
+                scroller = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True)
+                scroller.set_child(bar)
+                root.append(scroller)
                 return bar
 
             def add_button(bar, label, cb, tip=None):
@@ -734,7 +822,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             bar.append(tsize)
             add_button(bar, "Delete", self.on_delete_selected, "Delete the selected picture or text")
             add_button(bar, "Paste", self.on_paste, "Paste a picture from the clipboard (Ctrl+V)")
-            tip = Gtk.Label(label="Drag with a finger to move around · drop pictures or slides here", hexpand=True, xalign=1)
+            tip = Gtk.Label(label="Drag with a finger to move around · drop pictures or slides here", hexpand=True, xalign=1,
+                            ellipsize=Pango.EllipsizeMode.END)
             tip.add_css_class("dim-label")
             bar.append(tip)
 
@@ -821,6 +910,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.open_note(open_name)
 
             win.present()
+            prune_pdf_store()
             self.refresh_recent()
             self.area.grab_focus()
             if slides:
@@ -923,6 +1013,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 self.on_redo() if shift else self.on_undo()
             elif ctrl_down and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
                 self.on_redo()
+            elif keyval == Gdk.KEY_F11:                      # full screen on / off
+                self.win.unfullscreen() if self.win.is_fullscreen() else self.win.fullscreen()
             elif keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
                 self.on_delete_selected()
             else:
@@ -1143,14 +1235,14 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     n = convert_slides(
                         path,
                         lambda t: GLib.idle_add(self.show_progress, label + t),
-                        lambda i, total, data, pdf: GLib.idle_add(self.slide_ready, path, name, i, total, data, pdf))
+                        lambda i, total, ratio, pdf: GLib.idle_add(self.slide_ready, path, name, i, total, ratio, pdf))
                     err = None
                 except Exception as e:  # noqa: BLE001
                     n, err = 0, str(e)
                 GLib.idle_add(self.slides_done, path, name, n, err, done)
             threading.Thread(target=work, daemon=True).start()
 
-        def slide_ready(self, path, name, i, total, data, pdf=None):
+        def slide_ready(self, path, name, i, total, ratio, pdf):
             """One more slide arrived: show it straight away, below the previous one.
 
             Slides stay 'pending' (visible, but not yet part of the note) until the whole deck is
@@ -1169,11 +1261,9 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.pending[path] = []
                     z = min(1.0, (w - 80) / SLIDE_DISPLAY_WIDTH)
                     self.set_view(z, 40 - x0 * z, 40 - y0 * z)   # first slide at the top-left of the view
-                tex = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
-                height = SLIDE_DISPLAY_WIDTH * tex.get_height() / tex.get_width()
-                self.pending[path].append(
-                    Item("image", st["x"], st["y"], width=SLIDE_DISPLAY_WIDTH, texture=tex, png=data,
-                         pdf=(pdf, i - 1) if pdf else None))
+                height = SLIDE_DISPLAY_WIDTH * ratio
+                self.pending[path].append(Item("image", st["x"], st["y"], width=SLIDE_DISPLAY_WIDTH,
+                                               ratio=ratio, pdf=(pdf, i - 1)))
                 st["y"] += height * (1 + SLIDE_GAP_RATIO)
                 self.show_progress(f"“{name}”: slide {i} of {total} ready" + ("" if i < total else "."))
                 self.area.queue_draw()
@@ -1252,8 +1342,8 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             if item.kind == "sign":
                 return item.x, item.y, item.width, item.width * item.sign["aspect"]
             if item.kind == "image":
-                tw, th = item.texture.get_width(), item.texture.get_height()
-                return item.x, item.y, item.width, item.width * th / tw
+                ratio = item.ratio or item.texture.get_height() / item.texture.get_width()
+                return item.x, item.y, item.width, item.width * ratio
             pw, ph = self.make_layout(item).get_pixel_size()
             return item.x, item.y, max(pw, 8), max(ph, 8)
 
@@ -1279,7 +1369,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
         def page_colours(self, page, rect):
             """(background, ink) colours of the page picture around and inside rect, as 0..1 triples."""
             import cairo
-            surf = cairo.ImageSurface.create_from_png(io.BytesIO(page.png))
+            surf = cairo.ImageSurface.create_from_png(io.BytesIO(render_pdf_page(page.pdf[0], page.pdf[1] + 1)))
             data, stride, iw, ih = surf.get_data(), surf.get_stride(), surf.get_width(), surf.get_height()
             bx, by, bw, _ = self.item_box(page)
 
@@ -1373,7 +1463,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.push_undo()
                     self.items.append(Item("cover", x - 1, y - 1, width=w + 2, size=h + 2, color=cover["bg"]))
                     if text:
-                        self.items.append(Item("text", x, y, text=text, size=cover["font"], color=cover["fg"]))
+                        t = Item("text", x, y, text=text, size=cover["font"], color=cover["fg"])
+                        self.items.append(t)
+                        if is_rtl(text):                     # Hebrew and Arabic lines are anchored on the right
+                            t.x = x + w - self.item_box(t)[2]
             elif target is not None and target in self.items:
                 if not text:
                     self.push_undo()
@@ -1539,19 +1632,76 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             snapshot.save()
             snapshot.translate(Graphene.Point().init(self.ox, self.oy))
             snapshot.scale(self.zoom, self.zoom)
-            self.draw_content(snapshot)
+            self.draw_content(snapshot, view=(-self.ox / self.zoom, -self.oy / self.zoom,
+                                              w / self.zoom, h / self.zoom))
             snapshot.restore()
             snapshot.pop()
 
-        def draw_content(self, snapshot, export=False):
+        def page_texture_sync(self, key):
+            tex = self.tex_cache.get(key)
+            if tex is None:
+                tex = Gdk.Texture.new_from_bytes(GLib.Bytes.new(render_pdf_page(key[0], key[1] + 1)))
+                self.tex_cache[key] = tex
+            return tex
+
+        def page_texture(self, key):
+            """A PDF page's picture if it is ready; otherwise ask for it and draw a grey page meanwhile."""
+            tex = self.tex_cache.get(key)
+            if tex is not None:
+                self.tex_cache.move_to_end(key)
+                return tex
+            if key not in self.tex_pending and key not in self.tex_failed:
+                self.tex_pending.add(key)
+                self.render_pool.submit(self.render_job, key)
+            return None
+
+        def render_job(self, key):                                 # runs on a worker thread
+            try:
+                data = render_pdf_page(key[0], key[1] + 1)
+            except Exception as e:  # noqa: BLE001
+                log("page render failed:", e)
+                data = None
+            GLib.idle_add(self.page_rendered, key, data)
+
+        def page_rendered(self, key, data):
+            self.tex_pending.discard(key)
+            if data is None:
+                self.tex_failed.add(key)
+            else:
+                self.tex_cache[key] = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
+                while len(self.tex_cache) > PAGE_TEXTURES:
+                    self.tex_cache.popitem(last=False)
+            self.area.queue_draw()
+            return False
+
+        def draw_picture(self, snapshot, it, export, view):
+            x, y, w, h = self.item_box(it)
+            if view and not (x <= view[0] + view[2] and x + w >= view[0] and y <= view[1] + view[3] and y + h >= view[1]):
+                return                                             # off screen: nothing to draw or load
+            tex = it.texture
+            if tex is None and it.pdf:
+                if not export:
+                    tex = self.page_texture(it.pdf)
+                elif it.pdf in self.export_pages:
+                    tex = self.page_texture_sync(it.pdf)
+            rect = Graphene.Rect().init(x, y, w, h)
+            if tex is not None:
+                snapshot.append_texture(tex, rect)
+            else:                                                  # a page not drawn yet
+                grey = Gdk.RGBA()
+                grey.red = grey.green = grey.blue = 0.93
+                grey.alpha = 1.0
+                snapshot.append_color(grey, rect)
+
+        def draw_content(self, snapshot, export=False, view=None):
             """Everything on the surface, in world pixels (the caller sets up the transform)."""
             for it in self.items:                                  # pictures, under the pen
                 if it.kind == "image":
-                    snapshot.append_texture(it.texture, Graphene.Rect().init(*self.item_box(it)))
+                    self.draw_picture(snapshot, it, export, view)
             if not export:                                         # slides still arriving
                 for slides in self.pending.values():
                     for it in slides:
-                        snapshot.append_texture(it.texture, Graphene.Rect().init(*self.item_box(it)))
+                        self.draw_picture(snapshot, it, export, view)
             for it in self.items:                                  # patches over edited PDF text, under the pen
                 if it.kind == "cover":
                     rgba = Gdk.RGBA()
@@ -1627,6 +1777,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             white = Gdk.RGBA()
             white.red = white.green = white.blue = white.alpha = 1.0
             snap.append_color(white, Graphene.Rect().init(bx, by, bw, bh))
+            self.export_pages = {it.pdf for it in self.pdf_pages()[:EXPORT_MAX_PAGES]}
             self.draw_content(snap, export=True)
             node = snap.to_node()
             # A private offscreen renderer: the window's own renderer was missing in a long-lived
@@ -1731,38 +1882,56 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.status.set_text("Page moved.")
             self.area.queue_draw()
 
+        def unturnable(self, it):
+            """Marks on a page that can't turn with it: typed text, signatures, patches over edited text."""
+            x, y, w, h = self.item_box(it)
+
+            def inside(px, py):
+                return x <= px <= x + w and y <= py <= y + h
+            return [i for i in self.items if (i.kind == "text" and inside(i.x, i.y))
+                    or (i.kind in ("sign", "cover") and inside(*self.item_centre(i)))]
+
         def rotate_page(self, *_):
             it = self.target_page()
             if it is None:
                 return
             from pypdf import PdfWriter
             src, idx = it.pdf
-            bx, by, bw, bh = self.item_box(it)
-            if any(i.kind == "cover" and bx <= self.item_centre(i)[0] <= bx + bw
-                   and by <= self.item_centre(i)[1] <= by + bh for i in self.items):
-                self.status.set_text("Turn the page before editing its text (edited text can't be turned).")
-                return
+            x, y, w, h = self.item_box(it)
+            loose = self.unturnable(it)
+            flat = new = None
             try:
+                PDF_STORE.mkdir(parents=True, exist_ok=True)
+                if loose:          # make the page's marks part of the page itself, so the turn carries them
+                    flat = PDF_STORE / f"flat-{os.getpid()}-{time.time_ns()}.pdf"
+                    self.export_pdf(flat, [self.pdf_pages().index(it) + 1])
+                    src, idx = str(flat), 0
                 writer = PdfWriter(clone_from=src)
                 writer.pages[idx].rotate(90)
-                PDF_STORE.mkdir(parents=True, exist_ok=True)
                 tmp = PDF_STORE / f"rot-{os.getpid()}-{time.time_ns()}.pdf"
                 with open(tmp, "wb") as f:
                     writer.write(f)
                 new = PDF_STORE / f"{file_sha1(tmp)}.pdf"
                 os.replace(tmp, new)
-                png = render_pdf_page(new, idx + 1)
             except Exception as e:  # noqa: BLE001
                 log("rotate failed:", e)
                 self.status.set_text(f"Could not rotate: {e}")
                 return
-            x, y, w, h = self.item_box(it)
+            finally:
+                if flat:
+                    flat.unlink(missing_ok=True)
             self.push_undo()
+
+            def inside(px, py):
+                return x <= px <= x + w and y <= py <= y + h
+            if loose:              # the marks are in the page now: drop the loose copies
+                self.strokes = [st for st in self.strokes if not inside(*stroke_centre(st))]
+                self.items = [i for i in self.items if not any(i is m for m in loose)]
             # a clockwise quarter turn: a point u across and v down the page lands h - v across, u down
             self.transform_marks([((x, y, w, h), lambda px, py: (x + h - (py - y), y + (px - x)))])
-            it.texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(png))
-            it.png, it.pdf, it.width = png, (str(new), idx), h
-            self.status.set_text("Page turned. Undo turns it back.")
+            it.pdf, it.width, it.ratio = (str(new), idx), h, 1 / it.ratio
+            self.status.set_text("Page turned. Undo turns it back."
+                                 + (" Its text, signature and marks are now part of the page." if loose else ""))
             self.area.queue_draw()
 
         # ---- signing: draw it once, place it on any page ------------------------
@@ -1889,8 +2058,14 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 if path.suffix.lower() != ".pdf":
                     path = path.with_name(path.name + ".pdf")
                 try:
-                    self.export_pdf(path, only)
-                    self.status.set_text(f"Saved PDF: {path}")
+                    r = self.export_pdf(path, only)
+                    msg = f"Saved PDF: {path}"
+                    if r["covers"] and not r["left"]:
+                        msg += ". The text you edited is removed from the file, not just hidden."
+                    elif r["left"]:
+                        msg += (f". {r['left']} edited line(s) are only covered: this PDF keeps that text inside, "
+                                "hidden. Don't count on it to hide anything.")
+                    self.status.set_text(msg)
                 except Exception as e:  # noqa: BLE001
                     log("pdf export failed:", e)
                     self.status.set_text(f"PDF failed: {e}")
@@ -1952,25 +2127,28 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     for _, c1, c2, p2 in segs:
                         ctx.curve_to(*c1, *c2, *p2)
                     ctx.stroke()
-            for it in self.items:
+            for it in self.items:                                  # typed text: the shaped glyph outlines, filled
                 if it.kind != "text":
                     continue
-                scale = 4.0                                        # text pictured at 4x: sharp when printed
-                bx, by, bw, bh = self.item_box(it)
-                snap = Gtk.Snapshot()
-                snap.scale(scale, scale)
-                rgba = Gdk.RGBA()
-                rgba.red, rgba.green, rgba.blue = it.color
-                rgba.alpha = 1.0
-                snap.append_layout(self.make_layout(it), rgba)
-                tex = self.get_renderer().render_texture(
-                    snap.to_node(), Graphene.Rect().init(0, 0, math.ceil(bw * scale) + 4, math.ceil(bh * scale) + 4))
-                surf = cairo.ImageSurface.create_from_png(io.BytesIO(tex.save_to_png_bytes().get_data()))
+                pb = Gsk.PathBuilder.new()
+                pb.add_layout(self.make_layout(it))
                 ctx.save()
                 ctx.translate(it.x, it.y)
-                ctx.scale(1 / scale, 1 / scale)
-                ctx.set_source_surface(surf, 0, 0)
-                ctx.paint()
+                ctx.set_source_rgb(*it.color)
+
+                def seg(op, pts, n, weight, _data=None):
+                    kind = op.value_nick
+                    if kind == "move":
+                        ctx.move_to(pts[0].x, pts[0].y)
+                    elif kind == "line":
+                        ctx.line_to(pts[1].x, pts[1].y)
+                    elif kind == "cubic":
+                        ctx.curve_to(pts[1].x, pts[1].y, pts[2].x, pts[2].y, pts[3].x, pts[3].y)
+                    elif kind == "close":
+                        ctx.close_path()
+                    return True
+                pb.to_path().foreach(Gsk.PathForeachFlags.CUBIC, seg)
+                ctx.fill()
                 ctx.restore()
             ctx.restore()
 
@@ -1984,17 +2162,29 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 return self.export_canvas_pdf(path)
             if only:
                 pages = [pages[n - 1] for n in only]
-            readers, writer = {}, PdfWriter()
+            readers, writer, checks = {}, PdfWriter(), []
             for it in pages:
                 src, idx = it.pdf
                 if src not in readers:
                     readers[src] = PdfReader(src)
-                page = readers[src].pages[idx]
+                    if readers[src].is_encrypted:
+                        readers[src].decrypt("")
+                page = writer.add_page(readers[src].pages[idx])   # attached first: edits to it are reliable
                 page.transfer_rotation_to_content()                # so the marks need no rotation maths
                 box = self.item_box(it)
+                media, crop = page.mediabox, page.cropbox
+                k = float(crop.width) / box[2]                     # points per world pixel
+                covers = [c for c in self.items if c.kind == "cover"
+                          and box[0] <= self.item_centre(c)[0] <= box[0] + box[2]
+                          and box[1] <= self.item_centre(c)[1] <= box[1] + box[3]]
+                if covers:                                         # take the old text out of the page itself
+                    strip_text_in_rects(page, [
+                        (float(crop.left) + (c.x - box[0]) * k, float(crop.top) - (c.y + c.size - box[1]) * k,
+                         float(crop.left) + (c.x + c.width - box[0]) * k, float(crop.top) - (c.y - box[1]) * k)
+                        for c in covers])
+                    checks.append((len(writer.pages),
+                                   [((c.x - box[0]) * k, (c.y - box[1]) * k, c.width * k, c.size * k) for c in covers]))
                 if self.marks_in(box):
-                    media, crop = page.mediabox, page.cropbox
-                    k = float(crop.width) / box[2]                 # points per world pixel
                     buf = io.BytesIO()
                     surf = cairo.PDFSurface(buf, float(media.width), float(media.height))
                     ctx = cairo.Context(surf)
@@ -2004,11 +2194,18 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.draw_cairo(ctx, box, images=False)
                     surf.finish()
                     page.merge_page(PdfReader(io.BytesIO(buf.getvalue())).pages[0])
-                writer.add_page(page)
             tmp = f"{path}.tmp"
             with open(tmp, "wb") as f:
                 writer.write(f)
             os.replace(tmp, path)
+            result = {"covers": sum(len(r) for _, r in checks), "left": 0}
+            for pageno, rects in checks:                           # is any of the old text still in the file?
+                lines = pdf_text_lines(path, pageno)[2]
+                for rx, ry, rw, rh in rects:
+                    if any(max(0.0, min(x1, rx + rw) - max(x0, rx)) * max(0.0, min(y1, ry + rh) - max(y0, ry))
+                           > 0.25 * rw * rh for _t, x0, y0, x1, y1 in lines):
+                        result["left"] += 1
+            return result
 
         def export_canvas_pdf(self, path):
             import cairo
@@ -2024,6 +2221,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             self.draw_cairo(ctx, (bx, by, bw, bh), images=True)
             surf.finish()
             os.replace(tmp, path)
+            return {"covers": 0, "left": 0}
 
         # ---- saving and opening ------------------------------------------------
         def has_content(self):
@@ -2044,11 +2242,12 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         if name not in zf.namelist():
                             zf.write(it.pdf[0], name, compress_type=zipfile.ZIP_STORED)
                         d["pdf"] = {"file": name, "page": it.pdf[1]}
-                    if it.kind == "image":
+                        d["ratio"] = it.ratio
+                    if it.kind == "image" and not it.pdf:       # a PDF page is drawn again from its PDF
                         d["image"] = f"images/{n}.png"
                         zf.writestr(d["image"], texture_png(it))
                     items.append(d)
-                state = {"version": 1,
+                state = {"version": 2,
                          "view": {"zoom": self.zoom, "ox": self.ox, "oy": self.oy},
                          "strokes": [{"color": list(s.color), "width": s.width, "alpha": s.alpha,
                                       "pts": [list(p) for p in s.pts]} for s in self.strokes],
@@ -2075,8 +2274,16 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                         out = PDF_STORE / Path(d["pdf"]["file"]).name
                         if not out.exists():
                             out.write_bytes(zf.read(d["pdf"]["file"]))
+                        os.utime(out)
                         it.pdf = (str(out), d["pdf"]["page"])
-                    if d["kind"] == "image":
+                        it.ratio = d.get("ratio")
+                        old = None
+                        if "image" in d:                            # saved when pages were kept as pictures
+                            iw, ih = struct.unpack(">II", zf.read(d["image"])[16:24])
+                            old = ih / iw
+                        if old is not None or not it.ratio:
+                            migrate_page(it, old)
+                    elif d["kind"] == "image":
                         data = zf.read(d["image"])
                         it.png = data
                         it.texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
@@ -2249,6 +2456,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     self.close_warned = True
                     self.status.set_text(self.status.get_text() + "  (Close again to discard.)")
                     return True
+            self.render_pool.shutdown(wait=False, cancel_futures=True)
             if screenshot:
                 Path(screenshot).unlink(missing_ok=True)
             return False

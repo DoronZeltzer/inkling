@@ -10,9 +10,10 @@ import time
 
 import gi
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib  # noqa: E402
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
-from pen_note import (CACHE_DIR, EXPORT_MAX_PIXELS, EXPORT_MAX_SIDE, NOTES_DIR, PROJECT_DIR,  # noqa: E402
+from pen_note import (EXPORT_MAX_PIXELS, PAGE_TEXTURES, PDF_STORE, Item, migrate_page, EXPORT_MAX_SIDE, NOTES_DIR, PROJECT_DIR,  # noqa: E402
                       SLIDE_GAP_RATIO, WORK_DIR, log)
 
 def strip_link(text):
@@ -64,7 +65,7 @@ def run(self):
 
         def after_deck():
             imgs = pics()
-            hs = [i.width * i.texture.get_height() / i.texture.get_width() for i in imgs]
+            hs = [self.item_box(i)[3] for i in imgs]
             ordered = all(imgs[k + 1].y > imgs[k].y for k in range(len(imgs) - 1))
             gaps = all(abs(imgs[k + 1].y - (imgs[k].y + hs[k]) - SLIDE_GAP_RATIO * hs[k]) < 0.5
                        for k in range(len(imgs) - 1))
@@ -72,7 +73,7 @@ def run(self):
             log("selftest slides, deck: slides:", len(imgs), "| in order:", ordered,
                 "| blank gap after each:", gaps, "| one column:", len({round(i.x, 3) for i in imgs}) == 1,
                 "| first slide at top-left of view:", abs(sx - 40) < 1 and abs(sy - 40) < 1,
-                "| picture size:", (imgs[0].texture.get_width(), imgs[0].texture.get_height()))
+                "| page shape (height/width):", round(imgs[0].ratio, 3))
             st["n"] = len(imgs)
             st["right"] = max(i.x + i.width for i in imgs)
             st["y1"] = imgs[0].y + hs[0] + 60
@@ -116,7 +117,7 @@ def run(self):
         pdfp = f"{d}/many.pdf"
         surf = cairo.PDFSurface(pdfp, 595, 842)
         c = cairo.Context(surf)
-        for n in range(1, 31):
+        for n in range(1, 401):
             c.set_source_rgb(0.9, 0.95, 1)
             c.paint()
             c.set_source_rgb(0, 0, 0.4)
@@ -125,42 +126,51 @@ def run(self):
             c.show_text(str(n))
             surf.show_page()
         surf.finish()
-        st = {"t0": time.monotonic(), "first": None, "end": None}
+        st = {"t0": time.monotonic(), "end": None}
 
         def pics():
             return [i for i in self.items if i.kind == "image"]
 
         def poll():
-            shown = sum(len(v) for v in self.pending.values())
-            if shown and st["first"] is None:
-                st["first"] = time.monotonic() - st["t0"]
-                st["shown_then"] = shown
+            if self.pending and not self.strokes:
                 line(100, 100, 200, 160)          # draw while the rest of the deck is still loading
             return st["end"] is None
 
-        GLib.timeout_add(20, poll)
+        GLib.timeout_add(5, poll)
 
         def after_first():
             st["end"] = time.monotonic() - st["t0"]
+            if not self.strokes:
+                line(100, 100, 200, 160)
             n, strokes = len(pics()), len(self.strokes)
-            log("selftest slides3, 30-page pdf: slides:", n,
-                "| first slide visible after %.1fs, whole deck after %.1fs" % (st["first"], st["end"]),
-                "| first slide shown before the deck was complete:", st["first"] < st["end"],
-                "| pending when first shown:", st["shown_then"],
+            log("selftest slides3, 400-page pdf: pages:", n, "| ready after %.1fs" % st["end"],
                 "| nothing left pending:", not self.pending)
             self.on_undo()
             log("selftest slides3 undo: one undo removes the whole deck and keeps my stroke:",
                 len(pics()) == 0 and len(self.strokes) == strokes == 1)
             self.on_redo()
+            t1 = time.monotonic()
+            from pypdf import PdfReader
+            big = f"{d}/big.pdf"
+            self.export_pdf(big)
+            log("selftest slides3 export: all pages are in the saved PDF:", len(PdfReader(big).pages) == 400,
+                "| took %.1fs" % (time.monotonic() - t1))
             t2 = time.monotonic()
 
             def after_second():
                 took = time.monotonic() - t2
-                log("selftest slides3 cache: second add of the same file: slides now:", len(pics()),
+                log("selftest slides3 cache: second add of the same file: pages now:", len(pics()),
                     "| took %.1fs" % took, "| served from cache:", any("cache" in m for m in self.msgs),
-                    "| cache dir:", sorted(x.name[-12:] for x in CACHE_DIR.iterdir()))
-                shutil.rmtree(d, ignore_errors=True)
-                self.win.close()
+                    "| stored pdfs:", len(list(PDF_STORE.glob("*.pdf"))) >= 1)
+
+                def drawn():
+                    log("selftest slides3 memory: pages kept drawn at once:", len(self.tex_cache),
+                        "| within the limit:", 0 < len(self.tex_cache) <= PAGE_TEXTURES)
+                    shutil.rmtree(d, ignore_errors=True)
+                    self.win.close()
+                    return False
+                self.area.queue_draw()
+                GLib.timeout_add(2500, drawn)
             self.add_slide_file(pdfp, done=after_second)
 
         self.add_slide_file(pdfp, done=after_first)
@@ -216,6 +226,92 @@ def run(self):
             "| saved_base:", self.saved_base)
         return False
 
+    if mode == "window":
+        win = self.win
+        mon = Gdk.Display.get_default().get_monitors().get_item(0).get_geometry()
+        mw, _, _, _ = win.measure(Gtk.Orientation.HORIZONTAL, -1)
+        mh, _, _, _ = win.measure(Gtk.Orientation.VERTICAL, -1)
+        log("selftest window: screen", (mon.width, mon.height), "| smallest the window can be:", (mw, mh),
+            "| fits the screen:", mw <= mon.width and mh <= mon.height)
+        state = {}
+
+        def check_full():
+            state["full"] = (win.is_fullscreen(), win.get_width(), win.get_height())
+            win.unfullscreen()
+            GLib.timeout_add(800, lambda: (win.maximize(), GLib.timeout_add(1200, check_max), False)[2])
+            return False
+
+        def check_max():
+            log("selftest window: fullscreen worked:", state["full"][0], "size", state["full"][1:],
+                "| maximize worked:", win.is_maximized(), "size", (win.get_width(), win.get_height()))
+            win.close()
+            return False
+        win.fullscreen()
+        GLib.timeout_add(1500, check_full)
+        return False
+    if mode == "pdfform":
+        # text inside an embedded form object can't be removed: the app must say it is only covered
+        from reportlab.pdfgen import canvas as rl
+        from pypdf import PdfReader
+        d = tempfile.mkdtemp()
+        src = f"{d}/form.pdf"
+        c = rl.Canvas(src, pagesize=(595, 842))
+        c.beginForm("f")
+        c.setFont("Helvetica", 30)
+        c.drawString(80, 700, "Hidden inside a form")
+        c.endForm()
+        c.doForm("f")
+        c.save()
+
+        def after():
+            page = self.pdf_pages()[0]
+            bx, by, bw, bh = self.item_box(page)
+            cover = self.line_cover(page, bx + 0.25 * bw, by + 0.17 * bh)
+            self.commit_text(None, cover["rect"][:2], "Changed", cover)
+            out = f"{d}/out.pdf"
+            res = self.export_pdf(out)
+            log("selftest pdfform: the app reports text it could not remove:", res["covers"] == 1 and res["left"] == 1, res)
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+
+        self.add_slide_file(src, done=after)
+        return False
+    if mode == "pdfheb":
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.pdfgen import canvas as rl
+        from pypdf import PdfReader
+        pdfmetrics.registerFont(TTFont("DJ", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
+        d = tempfile.mkdtemp()
+        src = f"{d}/heb.pdf"
+        logical = "שלום עולם זה משפט"
+        c = rl.Canvas(src, pagesize=(595, 842))
+        c.setFont("DJ", 28)
+        c.drawString(300, 700, logical[::-1])          # right-to-left text as generators lay it out: reversed on the page
+        c.drawString(80, 600, "Plain line")
+        c.save()
+
+        def after():
+            page = self.pdf_pages()[0]
+            bx, by, bw, bh = self.item_box(page)
+            cover = self.line_cover(page, bx + 0.69 * bw, by + 0.154 * bh)
+            log("selftest hebrew: the line is read in the right order:", cover is not None and cover["text"] == logical,
+                "|", repr(cover["text"]) if cover else None)
+            rx, ry, rw, rh = cover["rect"]
+            self.commit_text(None, (rx, ry), "עולם חדש", cover)
+            t = [i for i in self.items if i.kind == "text"][0]
+            log("selftest hebrew: retyped Hebrew sits on the right edge of the old line:",
+                abs(t.x + self.item_box(t)[2] - (rx + rw)) < 1.5)
+            out = f"{d}/out.pdf"
+            res = self.export_pdf(out)
+            plain = subprocess.run(["pdftotext", out, "-"], capture_output=True, text=True).stdout
+            log("selftest hebrew: old Hebrew removed from the file, other line kept:",
+                "משפט" not in plain and "Plain line" in plain, "| report:", res)
+            shutil.rmtree(d, ignore_errors=True)
+            self.win.close()
+
+        self.add_slide_file(src, done=after)
+        return False
     if mode == "pdftext":
         import cairo
         from pypdf import PdfReader, PdfWriter
@@ -238,6 +334,29 @@ def run(self):
         with open(src, "wb") as f:
             wr.write(f)
         dark = lambda r_, g, b: r_ < 110 and g < 110 and b < 110
+
+        # a page placed while pictures showed the whole media box (595 x 842) moves onto the crop box
+        old = Item("image", 100.0, 50.0, width=595.0, ratio=842 / 595, pdf=(src, 0))
+        migrate_page(old, 842 / 595)
+        log("selftest migrate: old page lined up with its crop box:",
+            abs(old.x - 130) < 1e-6 and abs(old.y - 92) < 1e-6 and abs(old.width - 535) < 1e-6
+            and abs(old.ratio - 760 / 535) < 1e-6)
+        import io as _io
+        import json as _json
+        import zipfile as _zip
+        png = _io.BytesIO()
+        cairo.ImageSurface(cairo.FORMAT_ARGB32, 595, 842).write_to_png(png)
+        v1 = f"{d}/old.pennote"
+        with _zip.ZipFile(v1, "w") as zf:
+            zf.writestr("state.json", _json.dumps({"version": 1, "view": {"zoom": 1, "ox": 0, "oy": 0}, "strokes": [], "items": [
+                {"kind": "image", "x": 100.0, "y": 50.0, "width": 595.0, "text": "", "size": 24.0, "color": [0.08, 0.08, 0.08],
+                 "auto": False, "image": "images/0.png", "pdf": {"file": "pdfs/x.pdf", "page": 0}}]}))
+            zf.writestr("images/0.png", png.getvalue())
+            zf.write(src, "pdfs/x.pdf")
+        _s, items_v1, _v = self.read_project(v1)
+        it_ = items_v1[0]
+        log("selftest migrate: an older saved note opens lined up, with no stored picture needed:",
+            abs(it_.x - 130) < 1e-6 and abs(it_.width - 535) < 1e-6 and it_.texture is None and it_.pdf is not None)
 
         def band(pdf, y0, y1):
             w, h, data = pixels(pdf, 1)
@@ -274,20 +393,34 @@ def run(self):
 
             self.commit_text(None, (rx, ry), "Changed it", cover)       # retype the line
             new = f"{d}/new.pdf"
-            self.export_pdf(new)
+            result = self.export_pdf(new)
             kinds = sorted(i.kind for i in self.items if i.kind in ("cover", "text"))
             log("selftest pdftext retype: a patch and the new text:", kinds == ["cover", "text"],
                 "| new text is drawn there:", 0 < band(new, 0.12, 0.26) < before_1 * 3,
                 "| next line untouched:", band(new, 0.28, 0.42) == before_2)
-            self.selected = page
-            self.rotate_page()
-            log("selftest pdftext: turning an edited page is refused:", "Turn the page before" in self.status.get_text())
+            text_after = PdfReader(new).pages[0].extract_text() or ""
+            log("selftest pdftext privacy: old words are gone from the file, other line kept:",
+                "Original" not in text_after and "Second line" in text_after,
+                "| report:", result)
 
             self.name_entry.set_text("text edit note")
             self.save()
             self.strokes, self.items = [], []
             self.open_note("text edit note")
             log("selftest pdftext reopen: patch and text came back:",
+                sorted(i.kind for i in self.items if i.kind in ("cover", "text")) == ["cover", "text"])
+
+            page = self.pdf_pages()[0]                                  # turning an edited page flattens it
+            self.selected = page
+            self.rotate_page()
+            turned = f"{d}/turned.pdf"
+            self.export_pdf(turned)
+            tp = PdfReader(turned).pages[0]
+            log("selftest pdftext turn: page is sideways, edits are in the page, none left loose:",
+                float(tp.mediabox.width) > float(tp.mediabox.height) and not [i for i in self.items if i.kind in ("cover", "text")],
+                "| old words still gone:", "Original" not in (tp.extract_text() or ""))
+            self.on_undo()
+            log("selftest pdftext turn undo: edits are back as edits:",
                 sorted(i.kind for i in self.items if i.kind in ("cover", "text")) == ["cover", "text"])
             shutil.rmtree(d, ignore_errors=True)
             self.win.close()
@@ -339,25 +472,27 @@ def run(self):
             self.extend(bx_, by_, 0.5)
             self.finish()
             self.set_mode("pen")
+            self.text_px = 70                                      # big, so its ink is easy to measure
             self.commit_text(None, self.to_world(*screen(p2, 0.2, 0.4)), "Hello שלום")   # text on page 3
             self.set_mode("pen")
 
+            def label(p):                                           # 1, 2 or 3; page 3 is the sideways one after the turn
+                return 3 if p.ratio < 1 else p.pdf[1] + 1
             w0, h0 = self.item_box(p2)[2:]                         # rotate page 3
             self.selected = p2
-            tx, ty = self.items[-1].x, self.items[-1].y
             self.rotate_page()
             w1, h1 = self.item_box(p2)[2:]
             log("selftest pdf rotate: page turned sideways:", abs(w1 - h0) < 1 and abs(h1 - w0) < 1,
-                "| its text moved with it:", (self.items[-1].x, self.items[-1].y) != (tx, ty))
+                "| typed text became part of the page:", not [i for i in self.items if i.kind == "text"])
 
             self.selected = p2                                     # move page 3 up one place
             self.move_page(-1)
             order = self.pdf_pages()
-            log("selftest pdf move: order is now page 1, 3, 2:", order == [p0, p2, p1],
+            log("selftest pdf move: order is now page 1, 3, 2:", [label(p) for p in order] == [1, 3, 2],
                 "| no overlap:", all(self.item_box(order[k])[1] + self.item_box(order[k])[3] <= order[k + 1].y
                                        for k in range(2)))
             self.on_undo()                                        # undo hands back copies: compare by page number
-            log("selftest pdf move undo: back to 1, 2, 3:", [p.pdf[1] for p in self.pdf_pages()] == [0, 1, 2])
+            log("selftest pdf move undo: back to 1, 2, 3:", [label(p) for p in self.pdf_pages()] == [1, 2, 3])
             self.on_redo()
             p0 = self.pdf_pages()[0]
 
@@ -365,7 +500,7 @@ def run(self):
             self.selected = p0
             self.delete_page()
             rest = self.pdf_pages()
-            log("selftest pdf delete: 2 pages left, page 1 gone:", [p.pdf[1] for p in rest] == [2, 1],
+            log("selftest pdf delete: 2 pages left, page 1 gone:", [label(p) for p in rest] == [3, 2],
                 "| first remaining page took its place:", abs(rest[0].y - y_first) < 1e-6)
 
             out = f"{d}/out.pdf"
@@ -395,7 +530,12 @@ def run(self):
                 "highlight", (round(ycx, 2), round(ycy, 2)), "->",
                 abs(bcx - 0.5) < 0.08 and abs(bcy - 0.55) < 0.08 and abs(ycx - 0.4) < 0.08 and abs(ycy - 0.25) < 0.05)
             imgs = subprocess.run(["pdfimages", "-list", out], capture_output=True, text=True).stdout.strip().splitlines()
-            log("selftest pdf export: typed text placed as a picture on page 1:", len(imgs) >= 3)
+            _, _, turned = pixels(out, 1)
+            _, _, plain = pixels(src, 3)
+            ink = lambda data: count_px(data, lambda r_, g, b: min(r_, g, b) < 150)      # the typed text is blue
+            log("selftest pdf export: typed text (Hebrew too) is in page 1 as outlines, not a picture:",
+                len(imgs) <= 2 and ink(turned) > ink(plain) * 1.2, "| images:", len(imgs) - 2,
+                "| ink turned/plain:", ink(turned), ink(plain))
 
             part = f"{d}/part.pdf"
             self.export_pdf(part, [2])
