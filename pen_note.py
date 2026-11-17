@@ -1715,7 +1715,10 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
             side.append(self.tabs_box)
             button("+ New note", self.on_new_tab, "A blank note in its own tab")
             self.tab_css = Gtk.CssProvider()
-            self.tab_css.load_from_string(".pennote-tab-active { background: alpha(currentColor, 0.15); border-radius: 6px; }")
+            self.tab_css.load_from_string(("@define-color accent_bg_color #7c3aed; @define-color accent_color #7c3aed; "
+                                      ".pennote-tab-active { background: alpha(#a78bfa, 0.25); border-radius: 6px; } "
+                                      "window.inkling-win { background: #27242f; }"))
+            self.win.add_css_class("inkling-win")
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.tab_css,
                                                       Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             head("OPEN (each in its own tab)")
@@ -2488,7 +2491,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                     snapshot.restore()
             if not export:                                         # what is selected, the selection box, the text frame
                 blue = Gdk.RGBA()
-                blue.red, blue.green, blue.blue, blue.alpha = 0.1, 0.45, 0.95, 1.0
+                blue.red, blue.green, blue.blue, blue.alpha = 0.486, 0.227, 0.929, 1.0
 
                 def outline(x, y, w, h, thick):
                     pb = Gsk.PathBuilder.new()
@@ -2513,7 +2516,7 @@ def run_canvas(screenshot, open_name=None, slides=None, files=()):
                 if self.marquee:
                     x0, y0, x1, y1 = self.marquee
                     fill = Gdk.RGBA()
-                    fill.red, fill.green, fill.blue, fill.alpha = 0.1, 0.45, 0.95, 0.12
+                    fill.red, fill.green, fill.blue, fill.alpha = 0.486, 0.227, 0.929, 0.12
                     snapshot.append_color(fill, Graphene.Rect().init(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0)))
                     outline(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0), 1)
 
